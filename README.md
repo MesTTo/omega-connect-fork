@@ -132,7 +132,7 @@ Coverage against the brief's definition of done:
 | An identical retry returning the recorded result | `test_identical_retry_returns_the_recorded_result`, `test_app_level_idempotency_also_holds` |
 | Tokens never in results, views or logs | `test_tokens_never_appear_in_results_views_traces_or_logs`, `test_device_code_sign_in_and_revoke` |
 | `programs_check` passes | COMPATIBLE with the pre-release copy: `cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-connect`. It sees only an empty view, so `test_contract.py` checks fuller views and every result with the hive's validators |
-| Live demo: read a Teams channel, then a write a person approves | to do on a scratch hive |
+| Live demo: read a Teams channel, then a write a person approves | to do on a scratch hive; server and steps in `examples/teams-mcp/`, whose last test rehearses them offline |
 
 ## Open points for the flagship team
 
@@ -174,3 +174,4 @@ Checked against `hive/PROGRAMS.md` in the pre-release copy of omegahive
 | `connect/store.py` | Per-swarm servers, encrypted credentials, traces, intents |
 | `connect/oauth.py` | OAuth 2.0 device authorization grant (standard library only) |
 | `tests/` | Fake host, mock MCP server, fake identity provider, tests |
+| `examples/teams-mcp/` | Microsoft Teams MCP server over Graph for the live demo (127.0.0.1 only), its tests and the demo steps |

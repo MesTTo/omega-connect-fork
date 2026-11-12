@@ -57,6 +57,9 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
   intents.json (app-level idempotency for use-tool). Files mode 0600.
 - `connect/oauth.py`: RFC 8628 device flow, standard library only; authority
   overridable with `OMEGA_CONNECT_OAUTH_AUTHORITY` (tests use a fake).
+- `examples/teams-mcp/`: MCP server over Microsoft Graph for the Teams demo,
+  separate from the app. 127.0.0.1 only; each call uses the token in its own
+  request's Authorization header, never stored or logged. README = demo steps.
 
 Classification rule: read only if the server says `readOnlyHint` and the
 owner has not reclassed it; the owner can demote (write, hidden), never
@@ -67,6 +70,7 @@ promote.
 ```sh
 pip install -r requirements-dev.txt
 python -m pytest -q tests            # 35 tests, ~34 s, localhost only
+python -m pytest -q examples/teams-mcp   # 24 tests, ~2 s, Graph simulated in memory
 ```
 
 Contract checker, from the pre-release copy next to this repo (until omegahive
@@ -94,7 +98,8 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
    Entra app registration (public client, device code enabled), delegated
    scopes for reading a Teams channel, then one write (post a message) behind
    use-tool on "ask". Pick the MCP endpoint (Work IQ / Agent 365 tooling
-   servers, or a Graph-based server over streamable HTTP).
+   servers, or a Graph-based server over streamable HTTP). A Graph-based one
+   is in `examples/teams-mcp/` (tested offline); not yet run on a real tenant.
 3. Scratch hive demo, recorded.
 4. Optional: the mind skill for native Omega minds wrapping
    `POST /api/agent/programs/omega-connect/act` (confirm with the team first).
