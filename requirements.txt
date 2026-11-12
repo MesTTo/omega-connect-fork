@@ -1,0 +1,3 @@
+# Installed into the hive's Python environment. Ranges, not pins, so the hive's own pins win.
+mcp>=1.10
+cryptography>=42
