@@ -35,7 +35,7 @@ APP = "omega-connect"
 SCOPES = ["https://graph.microsoft.com/Team.ReadBasic.All", "https://graph.microsoft.com/Channel.ReadBasic.All",
           "https://graph.microsoft.com/ChannelMessage.Read.All", "https://graph.microsoft.com/ChannelMessage.Send"]
 TEXT = "Hello from an Omega mind. A person approved this post before it was sent."
-STEPS = 12
+STEPS = 13
 
 
 def tail(path: pathlib.Path, lines: int = 40) -> str:
