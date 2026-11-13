@@ -3,8 +3,9 @@
 An OmegaHive app that lets the minds in a hive use outside tools through MCP
 servers (Microsoft 365, Dataverse, GitHub, Slack, Notion...). Reads run under
 the owner's choice of permission, once a person has accepted the tools as
-reads; every write goes through `use-tool`, which the owner normally keeps on
-"ask", so a person approves each one.
+reads; every write goes through `use-tool`, which the owner keeps on "ask", so
+a person approves each one. The app refuses a mind's `use-tool` that no person
+approved, even under an "allow" rule.
 
 Built against the "Omega tool connections: starter brief" (12 Nov 2026) and
 program contract 0.2 as described in
@@ -26,7 +27,7 @@ opens around 19–20 November.
 | `list-tools` | yes | read | Tools per server, each classed `read` or `write` |
 | `inspect-tool` | yes | read | One tool's description and full input schema |
 | `read-tool` | yes | read | Runs a tool only if it is classed `read` |
-| `use-tool` | yes | (write) | Runs any visible tool; the owner keeps it on "ask" |
+| `use-tool` | yes | (write) | Runs any visible tool; a mind's call needs a person's approval ("ask") |
 | `add-server`, `remove-server` | no | confirm | People only |
 | `accept-reads` | no | confirm | Accept the tools a server marks read-only as reads: a whole server, or one tool |
 | `reclass-tool` | no | confirm | Make a tool `write` or `hidden`, or back to `default` (never `read`) |
@@ -211,7 +212,7 @@ Behaviour that changes for a hive that ran 0.1.0:
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 48 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 49 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and

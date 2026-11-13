@@ -11,10 +11,11 @@ from pathlib import Path
 import pytest
 
 from conftest import ACCOUNT, DEMO, NEW_TOKEN, REFRESH, SECRET
-from fakehive import FakeHive, HostRefusal, run, validate_graph
+from fakehive import FakeHive, HostRefusal, mind_actor, run, validate_graph
 
 PERSON = "ada"   # the hive's ids carry no kind; ctx.actor says the kind
 MIND = "scout"
+APPROVED = {"id": "apr-0", "binding_digest": "sha256:0", "approved_by": f"user:{PERSON}"}  # for a ctx built by hand
 SIGNIN = {"kind": "oauth-device", "tenant": "organizations",
           "client_id": "11111111-2222-3333-4444-555555555555", "scopes": ["Mail.Read"]}
 
@@ -26,6 +27,19 @@ def add(hive, swarm, name, url=None, **extra):
 
 def mind(hive, swarm, action, key, approval_id=None, **params):
     return run(hive.agent_act(swarm, MIND, action, params, key, approval_id))
+
+
+def person_approves(hive, swarm, key, **params):
+    """A mind asks to run use-tool and a person approves; returns the approval id the mind sends back."""
+    asked = mind(hive, swarm, "use-tool", key, **params)
+    assert asked["status"] == "approval_required", asked
+    hive.approve(asked["approval_id"], PERSON)
+    return asked["approval_id"]
+
+
+def write(hive, swarm, key, **params):
+    """use-tool as the hive runs it for a mind: asked, approved by a person, sent again with the approval."""
+    return mind(hive, swarm, "use-tool", key, person_approves(hive, swarm, key, **params), **params)
 
 
 def review(hive, swarm, server):
@@ -154,13 +168,11 @@ def test_use_tool_waits_for_a_person(hive, demo_url):
 
 
 def test_identical_retry_returns_the_recorded_result(hive, demo_url):
-    hive.attach(MIND, "use-tool", "allow")
     add(hive, "s1", "demo", demo_url)
     review(hive, "s1", "demo")
     args = {"title": "once", "text": "1"}
-    first = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
-    run(hive.agent_act("s1", MIND, "use-tool",
-                       {"server": "demo", "tool": "delete_notes", "arguments": {}}, "w-del"))
+    first = write(hive, "s1", "w1", server="demo", tool="create_note", arguments=args)
+    write(hive, "s1", "w-del", server="demo", tool="delete_notes", arguments={})
     retry = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
     assert retry == first  # recorded, not re-run: the note stays deleted
     assert "once" not in mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"]
@@ -175,7 +187,7 @@ def test_app_level_idempotency_also_holds(program, demo_url):
 
     hive = FakeHive(program)
     add(hive, "s1", "demo", demo_url)
-    ctx = Ctx(swarm_id="s1", actor={"kind": "mind", "id": MIND}, command={"idempotency_key": "same"})
+    ctx = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND, APPROVED), command={"idempotency_key": "same"})
     params = {"server": "demo", "tool": "create_note", "arguments": {"title": "a", "text": "b"}}
     first = run(program.act(ctx, "use-tool", [], params))
     second = run(program.act(ctx, "use-tool", [], params))
@@ -230,7 +242,7 @@ def test_a_write_that_never_went_out_is_not_reported_as_unknown(program, demo_ur
 
     hive = FakeHive(program)
     add(hive, "s1", "demo", demo_url)
-    ctx = Ctx(swarm_id="s1", actor={"kind": "mind", "id": MIND}, command={"idempotency_key": "w1"})
+    ctx = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND, APPROVED), command={"idempotency_key": "w1"})
     params = {"server": "demo", "tool": "create_note", "arguments": {"title": "a", "text": "b"}}
     call = program.ENGINE.call
 
@@ -243,6 +255,23 @@ def test_a_write_that_never_went_out_is_not_reported_as_unknown(program, demo_ur
     monkeypatch.setattr(program.ENGINE, "call", call)
     done = run(program.act(ctx, "use-tool", [], params))
     assert done["status"] == "done" and "prior_failed" not in done["detail"]
+
+
+def test_a_minds_write_needs_a_person_even_under_allow(hive, demo_url):
+    """Every write is approved by a person (the brief). A mind's rule can still say "allow", for
+    instance a pattern written for its reads that also matches use-tool, so the app refuses a mind's
+    use-tool that no person approved, and traces the refusal. A person's own use-tool still runs."""
+    hive.attach(MIND, "use-tool", "allow")
+    add(hive, "s1", "demo", demo_url)
+    review(hive, "s1", "demo")
+    note = {"server": "demo", "tool": "create_note", "arguments": {"title": "x", "text": "y"}}
+    refused = mind(hive, "s1", "use-tool", "w1", **note)
+    assert refused["status"] == "refused" and refused["detail"]["type"] == "approval_needed"
+    assert mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"] \
+        == "(no notes)"
+    [traced] = [t for t in hive.program.store_mod.SwarmStore("s1").traces(10) if t["action"] == "use-tool"]
+    assert traced["status"] == "refused" and traced["reason"] == "no-approval" and traced["actor"] == f"mind:{MIND}"
+    assert run(hive.person_act("s1", PERSON, "use-tool", [], note))["status"] == "done"
 
 
 def test_tokens_never_appear_in_results_views_traces_or_logs(hive, guarded_url, caplog, monkeypatch, tmp_path):
@@ -583,21 +612,21 @@ def test_sign_in_needs_an_encryption_key(hive, guarded_url, fake_authority, monk
 
 
 # ------------------------------------------------------------------ token renewal
-# These calls go through use-tool on allow: they are about tokens, not about classes.
+# These calls go through use-tool, each approved by a person first: they are about tokens, not about classes.
 
 def test_a_token_renewal_does_not_block_the_event_loop(hive, guarded_url, fake_authority):
     """The identity provider is called in a thread: other work on the hive's loop goes on."""
-    hive.attach(MIND, "use-tool", "allow")
     fake_authority.pending_polls = 0
     add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
     sign_in(hive, "s1", "m365")
     expire(hive, "s1", "m365")
     fake_authority.refresh_delay = 1.0
     gaps = []
+    call = {"server": "m365", "tool": "add", "arguments": {"a": 1, "b": 1}}
+    approval_id = person_approves(hive, "s1", "w1", **call)
 
     async def act_while_ticking():
-        acting = asyncio.ensure_future(hive.agent_act(
-            "s1", MIND, "use-tool", {"server": "m365", "tool": "add", "arguments": {"a": 1, "b": 1}}, "w1"))
+        acting = asyncio.ensure_future(hive.agent_act("s1", MIND, "use-tool", call, "w1", approval_id))
         last = time.monotonic()
         while not acting.done():
             await asyncio.sleep(0.05)
@@ -613,28 +642,29 @@ def test_a_token_renewal_does_not_block_the_event_loop(hive, guarded_url, fake_a
 def test_calls_on_several_loops_renew_the_token_once(hive, guarded_url, fake_authority):
     """Entra rotates refresh tokens, each works once. Four calls that find the token expired at the
     same time, each on its own event loop, renew it once and all go through."""
-    hive.attach(MIND, "use-tool", "allow")
     fake_authority.pending_polls = 0
     add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
     sign_in(hive, "s1", "m365")
     expire(hive, "s1", "m365")
     fake_authority.refresh_delay = 0.5
+    calls = [{"server": "m365", "tool": "add", "arguments": {"a": n, "b": 1}} for n in range(4)]
+    approvals = [person_approves(hive, "s1", f"w{n}", **calls[n]) for n in range(4)]
     with ThreadPoolExecutor(4) as pool:
-        results = list(pool.map(lambda n: mind(hive, "s1", "use-tool", f"w{n}", server="m365", tool="add",
-                                               arguments={"a": n, "b": 1}), range(4)))
+        results = list(pool.map(lambda n: mind(hive, "s1", "use-tool", f"w{n}", approvals[n], **calls[n]), range(4)))
     assert [r["status"] for r in results] == ["done"] * 4, results
     assert fake_authority.refreshes == 1
 
 
 def test_a_renewal_that_ends_after_a_revoke_does_not_bring_the_token_back(hive, guarded_url, fake_authority):
-    hive.attach(MIND, "use-tool", "allow")
     fake_authority.pending_polls = 0
     add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
     sign_in(hive, "s1", "m365")
     expire(hive, "s1", "m365")
     fake_authority.refresh_delay = 1.0
+    call = {"server": "m365", "tool": "add", "arguments": {"a": 1, "b": 1}}
+    approval_id = person_approves(hive, "s1", "w1", **call)
     with ThreadPoolExecutor(1) as pool:
-        renewing = pool.submit(mind, hive, "s1", "use-tool", "w1", server="m365", tool="add", arguments={"a": 1, "b": 1})
+        renewing = pool.submit(mind, hive, "s1", "use-tool", "w1", approval_id, **call)
         time.sleep(0.3)  # the renewal is waiting for the identity provider
         revoked = run(hive.person_act("s1", PERSON, "revoke", ["server:m365"], {}, confirmed=True))
         assert revoked["message"] == "sign-in deleted"
@@ -648,17 +678,16 @@ def test_a_renewed_token_opens_a_new_session(hive, token_server, fake_authority,
     """Headers are fixed when a session opens. After a renewal the next call goes out on a new
     session with the new token: the server now refuses the old one, as it would once it expired."""
     caplog.set_level(logging.DEBUG)
-    hive.attach(MIND, "use-tool", "allow")
     fake_authority.pending_polls = 0
     add(hive, "s1", "m365", token_server.url, signin=SIGNIN, timeout=5)
     sign_in(hive, "s1", "m365")
-    outputs = [mind(hive, "s1", "use-tool", "w1", server="m365", tool="add", arguments={"a": 1, "b": 2})]
+    outputs = [write(hive, "s1", "w1", server="m365", tool="add", arguments={"a": 1, "b": 2})]
     assert outputs[0]["detail"]["result"]["text"] == "3"
     first_session = hive.program.ENGINE.peek("s1", "m365")
     expire(hive, "s1", "m365")
     fake_authority.refreshed_token = NEW_TOKEN
     token_server.accept(NEW_TOKEN)
-    outputs.append(mind(hive, "s1", "use-tool", "w2", server="m365", tool="add", arguments={"a": 2, "b": 3}))
+    outputs.append(write(hive, "s1", "w2", server="m365", tool="add", arguments={"a": 2, "b": 3}))
     assert outputs[-1]["status"] == "done" and outputs[-1]["detail"]["result"]["text"] == "5"
     assert fake_authority.refreshes == 1 and hive.program.ENGINE.peek("s1", "m365") is not first_session
     outputs.append(run(hive.view("s1", PERSON)))
@@ -670,19 +699,21 @@ def test_a_call_running_when_the_token_is_renewed_finishes_on_its_session(hive, 
     """The session a renewal replaces is not cut: the call it is running finishes there, even past
     the grace a closing session normally gets."""
     monkeypatch.setattr(hive.program.engine_mod, "STOP_GRACE", 0.5)
-    hive.attach(MIND, "use-tool", "allow")
     fake_authority.pending_polls = 0
     add(hive, "s1", "m365", token_server.url, signin=SIGNIN, timeout=20)
     sign_in(hive, "s1", "m365")
-    assert mind(hive, "s1", "use-tool", "w1", server="m365", tool="add", arguments={"a": 1, "b": 2})["status"] == "done"
+    assert write(hive, "s1", "w1", server="m365", tool="add", arguments={"a": 1, "b": 2})["status"] == "done"
+    slow_call = {"server": "m365", "tool": "slow", "arguments": {"seconds": 2}}
+    renew_call = {"server": "m365", "tool": "add", "arguments": {"a": 2, "b": 3}}
+    slow_approval = person_approves(hive, "s1", "w-slow", **slow_call)
+    renew_approval = person_approves(hive, "s1", "w2", **renew_call)
     with ThreadPoolExecutor(1) as pool:
-        slow = pool.submit(mind, hive, "s1", "use-tool", "w-slow", server="m365", tool="slow",
-                           arguments={"seconds": 2})
+        slow = pool.submit(mind, hive, "s1", "use-tool", "w-slow", slow_approval, **slow_call)
         time.sleep(0.5)  # the slow call is out, with the first token
         expire(hive, "s1", "m365")
         fake_authority.refreshed_token = NEW_TOKEN
         token_server.accept(NEW_TOKEN)
-        renewed = mind(hive, "s1", "use-tool", "w2", server="m365", tool="add", arguments={"a": 2, "b": 3})
+        renewed = mind(hive, "s1", "use-tool", "w2", renew_approval, **renew_call)
         assert renewed["status"] == "done" and renewed["detail"]["result"]["text"] == "5"
         finished = slow.result(timeout=30)
     assert finished["status"] == "done" and finished["detail"]["result"]["text"] == "done"
