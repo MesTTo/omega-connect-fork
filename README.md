@@ -230,6 +230,13 @@ Behaviour that changes for a hive that ran 0.1.0:
   `oauth-device` servers also ask for `openid` and `profile`; a server added
   under 0.1.0 keeps its scopes, so its view says only "signed in" until it is
   removed and added again.
+- **`bearer-env` tokens go only where the operator says:** the token in
+  `OMEGA_CONNECT_CRED_<NAME>` is sent only to the origins listed in
+  `OMEGA_CONNECT_ORIGINS_<NAME>` (space- or comma-separated, such as
+  `https://api.githubcopilot.com`), checked when a server is added and before
+  every call. With nothing listed the token goes nowhere: for a `bearer-env`
+  server added under 0.1.0 the operator sets that list, or its calls fail
+  with an error naming the variable to set.
 - **Token renewal** runs in a thread, one at a time per server, and the
   renewed token opens a new MCP session; a call already running finishes on
   the old one.
