@@ -400,7 +400,7 @@ def _revision(swarm: str, store) -> str:
                   if ENGINE.peek(swarm, name) else {} for name in servers},
         "connected": {name: _server_status(swarm, rec)["status"] for name, rec in servers.items()},
         "signin": {name: _signin_text(swarm, store, name, rec) for name, rec in servers.items()},
-        "calls": store.trace_count(),
+        "calls": store.trace_mark(),
     }
     return "r-" + store_mod.digest(state)[7:23]
 
