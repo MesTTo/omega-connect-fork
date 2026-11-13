@@ -113,11 +113,12 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
   it without a result. When the hive delivers again an attempt that failed
   with an unknown effect and that record has no result yet, `use-tool` runs
   the tool again and the result says the first attempt may already have taken
-  effect (`detail.prior_failed: true`). The app needs its own record for this:
-  the hive's agent route delivers a mind's failed attempt again with the same
-  `record_id` and no `ctx.command.prior_failed`. An identical retry of a write
-  the hive recorded as done comes back as a recovery (`ctx.actor.recovery`,
-  with the approval it first ran under): `use-tool` answers from its own
+  effect (`detail.prior_failed: true`). The app needs its own record for this
+  if, as MesTTo reads flagship main, the hive's agent route delivers a mind's
+  failed attempt again with the same `record_id` and no
+  `ctx.command.prior_failed` (open point 6). An identical retry of a write the
+  hive recorded as done comes back as a recovery (`ctx.actor.recovery`, with
+  the approval it first ran under; open point 3): `use-tool` answers from its own
   record, and if that record is gone it refuses (`detail.type: "recovery"`)
   instead of running the tool a second time. Those records keep each answer
   whole, what the tool sent back included, so they are encrypted with the
@@ -251,8 +252,10 @@ Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
 1.30.
 
 `tests/fakehive.py` is a small stand-in for the host that follows the public
-contract notes and `hive/PROGRAMS.md`, and answers as
-`hive/core/program_actions.py` does: agent flag, no default allow,
+contract notes and `hive/PROGRAMS.md`, and on the minds' route answers as
+`hive/core/program_actions.py` on flagship main does (open points 3 and 6:
+confirmed by MesTTo, or MesTTo's reading; to verify on a scratch hive): agent
+flag, no default allow,
 `approval_required` with an `approval_id` that the mind sends back once a
 person approves, approvals bound to the exact request and its key and
 redeemed once, the approval in `ctx.actor.approval`, the hive's record id in
@@ -299,7 +302,11 @@ Coverage of the first review's changes:
 
 Checked against `hive/PROGRAMS.md` in the pre-release copy of omegahive
 (04fc3f2): sections 1–5, "Read actions" and 9d. The first review (Dot, for Jon
-Grove, on 8051f30) answered each of them.
+Grove, on 8051f30) answered each of them. MesTTo's pull requests (#3–#11) added
+what the minds' route does in `hive/core/program_actions.py` on flagship main,
+a private repository: that file, like `hive/requirements.txt` and
+`hive/ci-constraints.txt`, is not in the 04fc3f2 copy, so points 3, 6 and 7
+rest on MesTTo's word and are to verify on a scratch hive.
 
 1. **Settled: `use-tool` declares no effect.** The contract defines only
    `"effect": "read"`, for actions that change nothing and are safe to repeat;
@@ -310,27 +317,43 @@ Grove, on 8051f30) answered each of them.
    (`list-servers`, `add-server`) stays `["server"]`. The contract shows
    `applies_to` only as a list of kinds and says nothing about actions without
    an item; the review found this choice fine.
-3. **Corrected: `act()` is told who approved.** PROGRAMS.md doesn't say so,
-   but `hive/core/program_actions.py` (`agent_act`, `_approval`) passes the
-   approval it redeemed as `ctx.actor.approval = {id, binding_digest,
-   approved_by}`, `approved_by` being the approver's principal; it is `None`
-   when no person approved. `ctx.command` carries the request identity:
-   `idempotency_key` and `record_id`. Traces keep the approver, the approval's
-   id and `record_id`, which ties each call to the hive's own record of the act.
-4. **With the flagship team: which person a mind acts for.** Today a server
+3. **`act()` is told who approved: confirmed by MesTTo against flagship
+   main, to verify on a scratch hive.** PROGRAMS.md does not say so. On the
+   minds' route under "ask", the hive answers `approval_required` with an
+   `approval_id`; when the mind repeats the request with that `approval_id`,
+   `act()` gets `ctx.actor.approval = {id, binding_digest, approved_by}`,
+   `approved_by` being the approver's principal. Under "allow" the approval is
+   `None`. An identical retry of an act already recorded gets the original
+   approval again, with `recovery: true` (`hive/core/program_actions.py`,
+   `agent_act` and `_approval`). `ctx.command` carries the request identity:
+   `idempotency_key` and `record_id`. So traces keep the approver, the
+   approval's id and `record_id`; a mind's `use-tool` with no approval is
+   refused; and a recovery never runs a tool twice.
+4. **Later, on its own branch: which person a mind acts for.** Today a server
    uses the token of the person who last completed `connect`, and the view
-   shows which account that is. Choosing a token per acting mind needs to know
-   which person a mind acts for, and the contract does not say. Section 9d
-   mentions an action field `approver: "person"` (only a named person may
-   confirm, never the local operator password); it may suit `connect`, whose
-   token belongs to whoever signs in, but the copy does not define it further.
+   shows which account that is. Issue #8 proposes a sign-in per person, which
+   a person lends to the swarm's minds on purpose, with a mind's write
+   approved by the lender and `use-tool` declaring `approver: "person"` (only
+   a named person, never the local operator password; PROGRAMS.md 9d). It is
+   not in this branch: it comes later, on the branch `per-person-signin`.
 5. **Agreed, as a separate small piece:** the mind skill for native Omega
    minds (brief, "a second, smaller piece").
-6. **Settled: failed writes delivered again after "ask".** Section 9d
-   describes `prior_failed` for acts a person confirms in the host. For a
-   mind, `hive/core/program_actions.py` (`agent_act`) delivers a failed
-   attempt again only after a new approval, with the same `record_id` and no
-   `prior_failed`, so the app keeps its own record of each call that went out.
+6. **Failed writes delivered again after "ask": MesTTo's reading of flagship
+   main, to confirm.** Section 9d describes `prior_failed` for acts a person
+   confirms in the host. For a mind, MesTTo reads `hive/core/program_actions.py`
+   (`agent_act`) as delivering a failed attempt again only after a new
+   approval, with the same `record_id` and no `prior_failed`. The app does not
+   depend on it: it records each call just before it goes out, so it knows
+   such an attempt either way.
+7. **Dependencies: no conflict, by MesTTo's check, to confirm.** MesTTo
+   resolved `requirements.txt` with the hive's `hive/requirements.txt` under
+   the pins of its CI (`pip install --dry-run -c hive/ci-constraints.txt`,
+   Python 3.12): nothing clashes and no pinned version moves. MCP SDK 2.3 adds
+   13 packages the hive does not pin (`mcp`, `mcp-types`, `httpx2`,
+   `httpcore2`, `jsonschema`, `jsonschema-specifications`, `referencing`,
+   `rpds-py`, `attrs`, `pyjwt`, `python-multipart`, `sse-starlette`,
+   `truststore`), so the ranges stay as they are. Those two files are not in
+   the 04fc3f2 copy, so this was not repeated here.
 
 ## Layout
 

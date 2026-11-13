@@ -38,6 +38,14 @@ The brief, in short:
   confirm actions.
 - Raise `PermissionError` in `view()` to refuse a swarm.
 - Capabilities are not a sandbox; the app runs in the hive process.
+- The minds' route, from `hive/core/program_actions.py` on flagship main
+  (private; not in the 04fc3f2 copy), confirmed by MesTTo, to verify on a
+  scratch hive: "ask" answers `approval_required` with an `approval_id`; the
+  repeated request reaches `act()` with `ctx.actor.approval = {id,
+  binding_digest, approved_by}` (`None` under "allow"); an identical retry of
+  a done act comes back with the original approval and `recovery: true`.
+  By MesTTo's reading, to confirm: a mind's failed attempt comes back after a
+  new approval with the same `record_id` and no `prior_failed`.
 
 Reference: https://github.com/omega-flagship/omegahive-schematics (06-apps),
 https://github.com/omega-flagship/omega-tools (template app). The omegahive
@@ -120,9 +128,15 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
    First review (Dot for Jon, on 8051f30) handled on branch `review-1` as
    0.2.0 (13 Nov 2026): reads reviewed by a person, definition digests,
    device code only in the connect result, locked token renewal, new session
-   on a new token, `mcp>=1.30,<3`. It settled README open points 1–3 and 5;
-   4 and 6 are with the flagship team. Not done from that review: checking
-   `mcp`'s dependencies against the hive's pins, and the live demo.
+   on a new token, `mcp>=1.30,<3`. It settled README open points 1, 2 and 5.
+   MesTTo's PRs #3–#7 and #9–#11 merged into `review-1` (13 Nov 2026): the
+   fake host as the hive's minds' route, the approver in the trace, a mind's
+   write only with a person's approval, bearer tokens only to listed origins,
+   the 400-item view, input checks, durable store, browser sign-in with PKCE.
+   Then: recoveries never run a tool twice, use-tool's records encrypted.
+   Open points 3 (confirmed by MesTTo), 6 and 7 (dependencies, MesTTo's
+   check) are to verify on a scratch hive; 4 is issue #8, on the branch
+   `per-person-signin`.
 2. Microsoft 365 showcase on a dev tenant (Microsoft 365 Developer Program):
    Entra app registration (public client, device code enabled), delegated
    scopes for reading a Teams channel, then one write (post a message) behind
