@@ -73,7 +73,8 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
   separate from the app. 127.0.0.1 only; each call uses the token in its own
   request's Authorization header, never stored or logged. README = demo steps.
   `demo.py` runs them on a real tenant in FakeHive (temporary store, Fernet key
-  per run, the approval asked in the terminal, output filtered of tokens);
+  per run, device code or browser sign-in, the approval asked in the terminal,
+  output filtered of tokens);
   `test_demo.py` drives it as a person would, with Graph and sign-in simulated.
 
 Classification rule: read only if the server says `readOnlyHint`, a person
@@ -90,7 +91,7 @@ can finish it.
 ```sh
 pip install -r requirements-dev.txt
 python -m pytest -q tests            # 61 tests, ~65 s, localhost only
-python -m pytest -q examples/teams-mcp   # 30 tests, ~13 s, Graph simulated in memory
+python -m pytest -q examples/teams-mcp   # 32 tests, ~17 s, Graph simulated in memory
 ```
 
 Contract checker, from the pre-release copy next to this repo (until omegahive

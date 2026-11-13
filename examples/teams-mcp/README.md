@@ -154,10 +154,18 @@ python examples/teams-mcp/demo.py
 1. It asks for the *Directory (tenant) ID* and the *Application (client) ID*.
    They are kept in memory and in the temporary folder only, and shown by their
    first eight characters, so that a recording does not carry them.
-2. **add-server** with the four delegated scopes, then **connect**: it prints
+2. **add-server** with the four delegated scopes, then **connect**, which asks
+   how you sign in. With **1**, the device code (Enter), it prints
    `https://microsoft.com/devicelogin` and a code. Sign in there with an account
-   of the tenant and accept the permissions. The demo goes on by itself once you
-   have, and shows the account that the view names.
+   of the tenant and accept the permissions; the demo goes on by itself once you
+   have. With **2**, the browser, for tenants whose security defaults block the
+   device code (every tenant created since July 2026), it opens the sign-in page
+   in your browser without printing its address, which carries the tenant and
+   client IDs (where no browser opens, it prints the address and says so). Sign
+   in and accept, then paste the whole address of the empty page the browser
+   lands on; a wrong or declined one is asked again, and Enter alone stops the
+   demo. The app registration needs the redirect URI of *Before the demo*.
+   Either way the demo then shows the account that the view names.
 3. **list-tools**, where every tool is `write`, then **accept-reads** on the
    definitions just listed: the three reads become `read`, and
    `post_channel_message` stays `write`.
@@ -193,12 +201,14 @@ again.
 | demo.py: `teams-mcp did not start` | `mcp` or `uvicorn` missing (`pip install -r requirements-dev.txt`); the demo prints the server's log |
 | demo.py: `The code expired before anyone signed in`, or `Sign-in failed` naming an expired code | the code lasts about 15 minutes: run the demo again |
 | demo.py: `Sign-in failed` | the sign-in was cancelled or the permissions declined; the identity platform's own text follows |
+| demo.py: the device code sign-in fails on a tenant created since July 2026 | its security defaults block the device code: run the demo again and choose **2**, the browser |
+| demo.py, browser: `AADSTS50011` in the browser | the redirect URI `https://login.microsoftonline.com/common/oauth2/nativeclient` is missing under *Mobile and desktop applications* |
 | demo.py: the *Identity* line is not `https://login.microsoftonline.com` | `OMEGA_CONNECT_OAUTH_AUTHORITY` is set in the shell (the tests use it): unset it |
 
 ## Tests
 
 ```sh
-python -m pytest -q examples/teams-mcp      # 30 tests, ~13 s
+python -m pytest -q examples/teams-mcp      # 32 tests, ~17 s
 ```
 
 Graph is simulated in memory (`FakeGraph` replaces `server.graph_send`), so no
@@ -220,7 +230,10 @@ person would. The demo starts the server with the simulated Graph, and the
 sign-in goes to a fake identity platform. The tests check that nothing is
 posted before the `y`, and exactly once after it; that `n` posts nothing; that
 message text cannot drive the terminal; that the device code, the tokens and
-the full tenant and client IDs never appear on screen; that the demo uses its
+the full tenant and client IDs never appear on screen; that the browser sign-in
+gives its address to the browser, not to the screen (printing it, with a
+warning, only where no browser opens), asks again after a wrong or declined
+address, and redeems the code once with its PKCE verifier; that the demo uses its
 own store and key and passes none of the shell's `OMEGA_CONNECT_` settings to
 the server; and that a failed sign-in, Ctrl-C or a closed input stop the demo,
 with the server stopped and the temporary folder deleted.

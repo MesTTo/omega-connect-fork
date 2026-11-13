@@ -10,6 +10,7 @@ process. Nothing leaves this machine.
 """
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -22,7 +23,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -44,6 +45,7 @@ ACCOUNT = "ada@omegademo.example"
 ID_TOKEN = "eyJhbGciOiJSUzI1NiJ9." + base64.urlsafe_b64encode(
     json.dumps({"preferred_username": ACCOUNT}).encode()).decode().rstrip("=") + ".c2ln"
 DEVICE_CODE = "dev-code-5c1e9a"
+AUTH_CODE = "ac-0f3e9d2c1b4a5968"  # what the browser sign-in's landing address carries
 SHELL_KEY = "the-operators-own-key"  # set in the shell that runs the demo; not a Fernet key, so using it fails
 OTHER_TEAM = "0e0e0e0e-1111-4222-8333-444444444444"
 PRIVATE, QUIET = "19:5e1f0a7b@thread.tacv2", "19:0c2d3e4f@thread.tacv2"
@@ -79,7 +81,9 @@ def serve_with_fake_graph(argv: list[str]) -> None:
 
 class _IdentityPlatform(BaseHTTPRequestHandler):
     """The Microsoft identity platform for the demo's sign-in: a device code, `pending` answers
-    "authorization_pending", then a token. A step named in `refuse` gets that error instead."""
+    "authorization_pending", then a token. A browser sign-in's code (see authorize) is redeemed once,
+    only with the verifier for its challenge and the same redirect address. A step named in `refuse`
+    gets that error instead."""
     state = None  # set by the platform fixture
 
     def log_message(self, *args):
@@ -95,12 +99,17 @@ class _IdentityPlatform(BaseHTTPRequestHandler):
         elif step == "devicecode":
             body = {"device_code": DEVICE_CODE, "user_code": "ABCD-1234", "expires_in": 60, "interval": 1,
                     "verification_uri": "https://microsoft.com/devicelogin"}
+        elif form.get("grant_type") == "authorization_code":
+            issued = state.codes.pop(form.get("code"), None)
+            proof = base64.urlsafe_b64encode(hashlib.sha256(form.get("code_verifier", "").encode()).digest())
+            body = TOKENS if issued == (proof.rstrip(b"=").decode(), form.get("redirect_uri")) else \
+                {"error": "invalid_grant", "error_description": "AADSTS70008: the code, its verifier or the "
+                                                                "redirect address does not match"}
         elif state.pending > 0:
             state.pending -= 1
             body = {"error": "authorization_pending"}
         else:
-            body = {"access_token": TOKEN, "refresh_token": REFRESH, "expires_in": 3600, "id_token": ID_TOKEN,
-                    "scope": " ".join(SCOPES)}
+            body = TOKENS
         data = json.dumps(body).encode()
         self.send_response(400 if "error" in body else 200)
         self.send_header("Content-Type", "application/json")
@@ -109,13 +118,33 @@ class _IdentityPlatform(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-# Runs demo.py with this file in place of server.py. argv: demo.py, this file.
+TOKENS = {"access_token": TOKEN, "refresh_token": REFRESH, "expires_in": 3600, "id_token": ID_TOKEN,
+          "scope": " ".join(SCOPES)}
+
+
+def authorize(platform, address: str) -> str:
+    """The person signs in at the browser sign-in's address and consents: the identity platform issues a
+    code for its PKCE challenge, and the browser lands on the redirect address with that code."""
+    query = {k: v[0] for k, v in parse_qs(urlsplit(address).query).items()}
+    platform.codes[AUTH_CODE] = (query["code_challenge"], query["redirect_uri"])
+    return f"{query['redirect_uri']}?code={AUTH_CODE}&state={query['state']}&session_state=s-1"
+
+
+# Runs demo.py with this file in place of server.py, and in place of the person's browser a stand-in
+# that writes the address it gets to $FAKE_BROWSER_LOG and opens only if $FAKE_BROWSER is not "none".
+# argv: demo.py, this file.
 RUNNER = """\
-import importlib.util, pathlib, sys
+import importlib.util, os, pathlib, sys
 spec = importlib.util.spec_from_file_location("teams_demo", sys.argv[1])
 demo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(demo)
 demo.SERVER = pathlib.Path(sys.argv[2])
+
+def open_in_browser(url):
+    pathlib.Path(os.environ["FAKE_BROWSER_LOG"]).write_text(url)
+    return os.environ["FAKE_BROWSER"] != "none"
+
+demo.open_in_browser = open_in_browser
 sys.exit(demo.main())
 """
 
@@ -123,14 +152,16 @@ sys.exit(demo.main())
 class DemoRun:
     """demo.py in its own process, answered line by line as a person at the terminal would."""
 
-    def __init__(self, platform, tmp_path: Path):
+    def __init__(self, platform, tmp_path: Path, browser: bool = True):
         self.graph_log = tmp_path / "graph.log"
+        self.browser_log = tmp_path / "browser.log"
         self.temp = tmp_path / "tmp"  # the demo's temporary folder goes here
         self.temp.mkdir()
         self.operator_store = tmp_path / "operator-store"
         env = {name: value for name, value in os.environ.items() if not name.startswith("OMEGA_CONNECT_")}
         env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", TMPDIR=str(self.temp),
                    FAKE_GRAPH_LOG=str(self.graph_log), OMEGA_CONNECT_OAUTH_AUTHORITY=platform.url,
+                   FAKE_BROWSER_LOG=str(self.browser_log), FAKE_BROWSER="yes" if browser else "none",
                    # what an operator's shell may hold; the demo must use neither
                    OMEGA_CONNECT_DATA_DIR=str(self.operator_store), OMEGA_CONNECT_SECRET_KEY=SHELL_KEY)
         self.proc = subprocess.Popen([sys.executable, "-c", RUNNER, str(DEMO), __file__], env=env, cwd=tmp_path,
@@ -195,6 +226,10 @@ class DemoRun:
         lines = self.graph_log.read_text().splitlines() if self.graph_log.exists() else []
         return json.loads(lines[0]) if lines else None
 
+    def browser_address(self) -> str | None:
+        """The address the demo gave the browser, or None if it gave it none."""
+        return self.browser_log.read_text() if self.browser_log.exists() else None
+
     def graph(self) -> list[str]:
         """The Graph requests so far, as "METHOD path"."""
         return self.graph_log.read_text().splitlines()[1:] if self.graph_log.exists() else []
@@ -207,7 +242,7 @@ class DemoRun:
 
 @pytest.fixture
 def platform():
-    _IdentityPlatform.state = state = SimpleNamespace(pending=1, refuse={}, requests=[])
+    _IdentityPlatform.state = state = SimpleNamespace(pending=1, refuse={}, requests=[], codes={})
     server = ThreadingHTTPServer(("127.0.0.1", 0), _IdentityPlatform)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     state.url = f"http://127.0.0.1:{server.server_port}"
@@ -221,8 +256,8 @@ def start(platform, tmp_path):
     """Starts demo.py and sends it the given lines; after the test, stops it if it still runs."""
     runs = []
 
-    def start(*lines: str) -> DemoRun:
-        runs.append(DemoRun(platform, tmp_path))
+    def start(*lines: str, browser: bool = True) -> DemoRun:
+        runs.append(DemoRun(platform, tmp_path, browser))
         if lines:
             runs[-1].send(*lines)
         return runs[-1]
@@ -241,6 +276,8 @@ def test_the_demo_reads_the_channel_and_posts_only_after_a_yes(start, platform):
     run.expect("does not accept 'organizations'")
     run.send(TENANT, "not-a-guid", CLIENT_ID)
     run.expect("Give the Application (client) ID")
+    run.expect("Sign-in [1]: ")
+    run.send("")  # the device code
     run.expect("Code    ABCD-1234")
     run.expect("Which team? [1-2]: ")
     run.send("1")
@@ -268,11 +305,11 @@ def test_the_demo_reads_the_channel_and_posts_only_after_a_yes(start, platform):
     assert (path, form["client_id"], form["scope"]) == (
         f"/{TENANT}/oauth2/v2.0/devicecode", CLIENT_ID, " ".join(SCOPES + ["openid", "profile", "offline_access"]))
     assert run.server()["settings"] == []  # not even the key in the operator's shell
-    assert run.leftovers() == []
+    assert run.browser_address() is None and run.leftovers() == []
 
 
 def test_a_no_posts_nothing_and_message_text_cannot_drive_the_terminal(start):
-    run = start(TENANT, CLIENT_ID, "2", "1", "Hello", "n")
+    run = start(TENANT, CLIENT_ID, "", "2", "1", "Hello", "n")
     assert run.finish() == 0
     out = run.output
     assert "Eve evil" in out and "line 31mtwo" in out  # the text stays, without its controls
@@ -280,6 +317,48 @@ def test_a_no_posts_nothing_and_message_text_cannot_drive_the_terminal(start):
     assert "Not approved" in out and "No use-tool call in the trace" in out
     assert run.graph()[-1] == f"GET /teams/{OTHER_TEAM}/channels/{PRIVATE}/messages"
     assert not [request for request in run.graph() if request.startswith("POST")]
+    assert run.leftovers() == []
+
+
+def test_the_browser_sign_in_opens_the_address_and_takes_back_where_the_browser_lands(start, platform):
+    """For tenants that block the device code: the sign-in address goes to the browser, not to the screen,
+    since it carries the tenant and client IDs. A wrong or declined address is asked again; the right one
+    signs in, and the demo goes on to the post."""
+    run = start(TENANT, CLIENT_ID, "2")
+    run.expect("Address the browser landed on (Enter to stop): ")
+    address = run.browser_address()
+    query = {k: v[0] for k, v in parse_qs(urlsplit(address).query).items()}
+    assert urlsplit(address).path == f"/{TENANT}/oauth2/v2.0/authorize" and query["client_id"] == CLIENT_ID
+    assert query["code_challenge_method"] == "S256" and query["redirect_uri"].endswith("/common/oauth2/nativeclient")
+    landed = authorize(platform, address)
+    run.send(landed.replace("/common/oauth2/nativeclient", "/elsewhere"))
+    run.expect("✗ paste the whole address the browser landed on")
+    run.expect("Address the browser landed on (Enter to stop): ")
+    run.send(landed.split("?")[0] + "?error=access_denied&error_description=The+user+declined.")
+    run.expect("✗ the sign-in ended with access_denied: The user declined.")
+    run.send(landed)
+    run.expect(f"Sign-in: oauth-device (signed in as {ACCOUNT})")
+    run.expect("Which team? [1-2]: ")
+    run.send("1", "", "y")  # the team, the default text, the approval
+    assert run.finish() == 0
+    out = run.output
+    assert "The sign-in page is open in your browser" in out and "Demo complete." in out
+    for hidden in (address, TENANT, CLIENT_ID, AUTH_CODE, TOKEN, REFRESH, ID_TOKEN, SHELL_KEY):
+        assert hidden not in out
+    redeemed = [form for path, form in platform.requests if form.get("grant_type") == "authorization_code"]
+    assert len(redeemed) == 1 and redeemed[0]["redirect_uri"] == query["redirect_uri"]
+    assert not [path for path, _ in platform.requests if path.endswith("/devicecode")]
+    assert run.graph()[-1] == f"POST /teams/{TEAM}/channels/{CHANNEL}/messages"
+    assert run.leftovers() == []
+
+
+def test_without_a_browser_the_address_is_printed_with_a_warning(start):
+    run = start(TENANT, CLIENT_ID, "2", browser=False)
+    run.expect("Address the browser landed on (Enter to stop): ")
+    assert "pause a recording first" in run.output and run.browser_address() in run.output
+    run.send("")  # Enter: stop
+    assert run.finish() == 1
+    assert run.output.rstrip().endswith("Server stopped; temporary store, token and key deleted.")
     assert run.leftovers() == []
 
 
@@ -292,7 +371,7 @@ def test_a_no_posts_nothing_and_message_text_cannot_drive_the_terminal(start):
 ], ids=["public-client-flows-off", "declined"])
 def test_a_failed_sign_in_stops_the_demo_and_cleans_up(start, platform, refuse, says):
     platform.refuse = refuse
-    run = start(TENANT, CLIENT_ID)
+    run = start(TENANT, CLIENT_ID, "")
     assert run.finish() == 1
     assert says in run.output and "If something fails" in run.output
     assert run.output.rstrip().endswith("Server stopped; temporary store, token and key deleted.")
@@ -301,7 +380,7 @@ def test_a_failed_sign_in_stops_the_demo_and_cleans_up(start, platform, refuse, 
 
 def test_ctrl_c_stops_the_server_and_deletes_the_store(start, platform):
     platform.pending = 10 ** 6  # nobody signs in
-    run = start(TENANT, CLIENT_ID)
+    run = start(TENANT, CLIENT_ID, "")
     run.expect("the demo goes on by itself.")
     run.proc.send_signal(signal.SIGINT)
     assert run.finish() == 130

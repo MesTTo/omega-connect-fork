@@ -3,7 +3,8 @@
 Starts teams-mcp on 127.0.0.1, mounts omega-connect in the repository's fake hive
 (tests/fakehive.py) with a temporary store and a Fernet key made for this run, and
 walks the README demo on a real tenant: add-server with an oauth-device sign-in,
-connect (device code), list-tools, accept-reads, list_teams, list_channels,
+connect (a device code, or the browser for tenants whose security defaults block
+the device code), list-tools, accept-reads, list_teams, list_channels,
 read_channel_messages on the channel you pick, then use-tool posting a message.
 The mind's rule for use-tool is "ask": the request waits until you approve it here.
 
@@ -32,7 +33,9 @@ import tempfile
 import time
 import traceback
 import uuid
+import webbrowser
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from cryptography.fernet import Fernet
 
@@ -110,6 +113,17 @@ def start_server(log_path: Path) -> tuple[subprocess.Popen, str]:
     print("✗ teams-mcp did not start:")
     print(UNSAFE.sub("", log_path.read_text("utf-8", errors="replace")[-2000:]))
     raise Stop
+
+
+def open_in_browser(url: str) -> bool:
+    """Opens the address in the person's own browser without printing it. False where there is no
+    graphical browser: a text one would take over this terminal."""
+    if sys.platform not in ("darwin", "win32") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    try:
+        return webbrowser.open(url)
+    except webbrowser.Error:
+        return False
 
 
 def load_program():
@@ -223,6 +237,58 @@ class Demo:
 
     def connect(self) -> None:
         self.step("connect", "person, confirmed")
+        self.say("How do you sign in?", 2)
+        self.say("1. device code: a code to enter at microsoft.com/devicelogin", 4)
+        self.say("2. browser: for tenants whose security defaults block the device code, as on every tenant "
+                 "created since July 2026", 4)
+        while True:
+            choice = ask("  Sign-in [1]: ") or "1"
+            if choice in ("1", "2"):
+                break
+        if choice == "1":
+            self.device_code()
+        else:
+            self.browser()
+        server = next(item for item in self.view()["items"] if item["id"] == f"server:{SERVER_NAME}")
+        signin = next(line for line in server["text"].splitlines() if line.startswith("Sign-in"))
+        self.say(f"✓ In the view: {signin}", 2)
+        self.say("The token stays encrypted in the store; the view shows neither the token nor the code.", 2)
+
+    def browser(self) -> None:
+        """Authorization code with PKCE: the person signs in in a browser and pastes back the address it lands
+        on. The sign-in address carries the tenant and client IDs in full, so it is opened, not printed,
+        where a browser can be opened."""
+        self.call_line("connect", {"flow": "browser"}, [f"server:{SERVER_NAME}"])
+        started = self.person("connect", [f"server:{SERVER_NAME}"], {"flow": "browser"})
+        if started.get("status") != "needs_input":
+            self.need(started, "connect", HINT)  # says why, then stops
+        detail = started["detail"]
+        if open_in_browser(detail["authorization_url"]):
+            self.say("The sign-in page is open in your browser (its address carries the tenant and client IDs, "
+                     "so it is not printed here).", 2)
+        else:
+            self.say("No browser opens from here. Open this address in one; it carries the tenant and client "
+                     "IDs in full, so pause a recording first:", 2)
+            self.say(detail["authorization_url"], 4)
+        self.say("Sign in with an account of the tenant and accept the permissions. The browser then lands on an "
+                 f"empty page whose address starts with {detail['redirect_uri']}: copy that whole address.", 2)
+        while True:
+            landed = ask("  Address the browser landed on (Enter to stop): ")
+            if not landed:
+                raise Stop
+            # The code in it works once, with this run's PKCE verifier; still, it is never shown or kept.
+            self.secrets.update(code for code in parse_qs(urlsplit(landed).query).get("code", []) if len(code) >= 16)
+            self.call_line("connect", {"redirect_url": "<the address you pasted>"}, [f"server:{SERVER_NAME}"])
+            finished = self.person("connect", [f"server:{SERVER_NAME}"], {"redirect_url": landed})
+            if finished.get("status") == "done":
+                return
+            self.say(f"✗ {finished.get('message', '')}", 2)
+            if finished.get("status") != "error":  # refused: no sign-in is waiting any more (expired)
+                self.say(HINT, 2)
+                raise Stop
+            self.say("The sign-in is still open: paste the address again, or sign in again from the same page.", 2)
+
+    def device_code(self) -> None:
         self.call_line("connect", {}, [f"server:{SERVER_NAME}"])
         detail = self.need(self.person("connect", [f"server:{SERVER_NAME}"], {}), "connect", HINT)["detail"]
         self.say(f"Open    {detail['verification_uri']}", 2)
@@ -245,10 +311,6 @@ class Demo:
                 self.say(f"… waiting for the sign-in ({int(deadline - now)} s left)", 2)
                 reminder = now + 30
             time.sleep(1)
-        server = next(item for item in self.view()["items"] if item["id"] == f"server:{SERVER_NAME}")
-        signin = next(line for line in server["text"].splitlines() if line.startswith("Sign-in"))
-        self.say(f"✓ In the view: {signin}", 2)
-        self.say("The token stays encrypted in the store; the view shows neither the token nor the code.", 2)
 
     def list_tools(self) -> None:
         self.step("list-tools", f"mind {MIND}, rule allow")
