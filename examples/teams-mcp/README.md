@@ -2,7 +2,8 @@
 
 A small MCP server (streamable HTTP, `127.0.0.1` only) with four tools backed by
 Microsoft Graph. It is the server for the brief's live demo: a mind reads a
-Teams channel, asks to post, and a person approves.
+Teams channel, asks to post, and a person approves. `demo.py` runs that demo
+from a terminal against a real tenant ([Run it with demo.py](#run-it-with-demopy)).
 
 | Tool | Graph call | Delegated permission | Hint |
 |---|---|---|---|
@@ -125,31 +126,95 @@ the recorded result instead of posting again.
 
 To finish, **revoke** (person, confirmed) on `server:teams` deletes the token.
 
+## Run it with demo.py
+
+`demo.py` walks the steps above against your tenant from a terminal, without a
+hive. It mounts omega-connect in the repository's stand-in for the host
+(`tests/fakehive.py`) and plays both parts: the mind `scout` (`list-tools` and
+`read-tool` on *allow*, `use-tool` on *ask*), and you, the person who confirms
+and approves. It starts the server itself on a free port of `127.0.0.1`, and
+keeps the store in a temporary folder with a Fernet key made for the run;
+both are deleted at the end, and the token with them.
+
+From a checkout of this repository, once steps 1 and 2 of *Before the demo* are done:
+
+```sh
+pip install -r requirements-dev.txt    # mcp, cryptography, uvicorn
+python examples/teams-mcp/demo.py
+```
+
+1. It asks for the *Directory (tenant) ID* and the *Application (client) ID*.
+   They are kept in memory and in the temporary folder only, and shown by their
+   first eight characters, so that a recording does not carry them.
+2. **add-server** with the four delegated scopes, then **connect**: it prints
+   `https://microsoft.com/devicelogin` and a code. Sign in there with an account
+   of the tenant and accept the permissions. The demo goes on by itself once you
+   have, and shows the account that the view names.
+3. **list-tools**, where every tool is `write`, then **accept-reads** on the
+   definitions just listed: the three reads become `read`, and
+   `post_channel_message` stays `write`.
+4. **read-tool** `list_teams` and `list_channels`: choose a team and a channel by
+   number (when there is only one, it is chosen for you). Then
+   `read_channel_messages` prints the last 10 messages, labelled untrusted.
+5. **use-tool** `post_channel_message`: type the text the mind asks to post, or
+   press Enter for a default one. The request waits for a person: the demo shows
+   it (mind, tool, team, channel, text) and asks *Approve the post? (y/n)*.
+   Only `y` posts, once, as the account that signed in; `n` posts nothing.
+6. It prints the trace (actor, the hive's record id, who approved), runs
+   **revoke**, and checks that no token appears in the app's results and views,
+   in the store's plain files or in the logs.
+
+Then it stops the server and deletes the temporary folder; Ctrl-C at any step
+does the same. Tokens are never printed: every line goes through a filter that
+removes the token values of the sign-in, and the terminal control characters
+that a message could carry. Nothing is kept between runs, so each run signs in
+again.
+
 ## If something fails
 
 | Symptom | Cause |
 |---|---|
 | `AADSTS7000218` at connect | *Allow public client flows* is off |
 | `AADSTS50194` at connect | `organizations` with a single-tenant app: use the tenant ID |
+| `AADSTS700016` at connect | wrong client ID, or the app is registered in another tenant |
+| `AADSTS90002` at connect | wrong tenant ID |
 | `403` from read_channel_messages | no admin consent for `ChannelMessage.Read.All`, or the person is not in the team |
 | `401` from any tool | Graph refused the token: run `connect` again |
 | `connection refused` | the server is not running, or not on the hive's machine |
+| demo.py asks for the tenant ID again | `organizations` or `common`: give the Directory (tenant) ID, or the tenant's domain |
+| demo.py: `teams-mcp did not start` | `mcp` or `uvicorn` missing (`pip install -r requirements-dev.txt`); the demo prints the server's log |
+| demo.py: `The code expired before anyone signed in`, or `Sign-in failed` naming an expired code | the code lasts about 15 minutes: run the demo again |
+| demo.py: `Sign-in failed` | the sign-in was cancelled or the permissions declined; the identity platform's own text follows |
+| demo.py: the *Identity* line is not `https://login.microsoftonline.com` | `OMEGA_CONNECT_OAUTH_AUTHORITY` is set in the shell (the tests use it): unset it |
 
 ## Tests
 
 ```sh
-python -m pytest -q examples/teams-mcp      # 24 tests, ~2 s
+python -m pytest -q examples/teams-mcp      # 30 tests, ~13 s
 ```
 
 Graph is simulated in memory (`FakeGraph` replaces `server.graph_send`), so no
-request reaches Microsoft or any other outside address. The server runs on
-`127.0.0.1` in a thread and is called with omega-connect's own MCP client. The
-tests cover the tool hints, listing, plain-text messages, posting, id checks
-before any call, the size caps, the token of each request forwarded as it is,
-no call without a token, Graph errors explained without the token, nothing
-logged with the token, the `127.0.0.1` binding, Host and Origin checks, and the
-real transport not following redirects. The last test runs the demo above
-through omega-connect's actions in the repository's fake hive (sign-in and the
-review of the reads included, identity platform in memory) and checks that the
-token never appears in results, views, the store or the logs. They pass with
-MCP SDK 1.x and 2.x.
+request reaches Microsoft or any other outside address.
+
+`test_server.py` runs the server on `127.0.0.1` in a thread and calls it with
+omega-connect's own MCP client. Its tests cover the tool hints, listing,
+plain-text messages, posting, id checks before any call, the size caps, the
+token of each request forwarded as it is, no call without a token, Graph errors
+explained without the token, nothing logged with the token, the `127.0.0.1`
+binding, Host and Origin checks, and the real transport not following
+redirects. The last test runs the demo above through omega-connect's actions in
+the repository's fake hive (sign-in and the review of the reads included,
+identity platform in memory) and checks that the token never appears in
+results, views, the store or the logs.
+
+`test_demo.py` runs `demo.py` in its own process and answers its prompts as a
+person would. The demo starts the server with the simulated Graph, and the
+sign-in goes to a fake identity platform. The tests check that nothing is
+posted before the `y`, and exactly once after it; that `n` posts nothing; that
+message text cannot drive the terminal; that the device code, the tokens and
+the full tenant and client IDs never appear on screen; that the demo uses its
+own store and key and passes none of the shell's `OMEGA_CONNECT_` settings to
+the server; and that a failed sign-in, Ctrl-C or a closed input stop the demo,
+with the server stopped and the temporary folder deleted.
+
+Both files pass with MCP SDK 1.x and 2.x.
