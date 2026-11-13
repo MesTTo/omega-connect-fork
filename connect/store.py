@@ -207,6 +207,19 @@ class SwarmStore:
                 entry["minds"] = principal
             self._save_secrets(secrets)
 
+    def lend(self, server: str, principal: str) -> bool:
+        """Make a person's sign-in the one the swarm's minds use, in place of any other; False if they
+        have none."""
+        with self.lock:
+            secrets = self._secrets()
+            entry = self._signins(secrets, server)
+            if principal not in entry["people"]:
+                return False
+            entry["minds"] = principal
+            secrets[server] = entry
+            self._save_secrets(secrets)
+            return True
+
     def replace_credentials(self, server: str, principal: str, old: dict, new: dict) -> bool:
         """Store `new` only if the person's stored credentials are still `old`, so a renewal that
         finishes after a revoke or a new sign-in never writes over them."""

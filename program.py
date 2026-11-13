@@ -237,8 +237,8 @@ def _signin_owner(ctx, store, record: dict) -> str | None:
     if _actor_kind(ctx) == "mind":
         owner = store.signins(name)["minds"]
         if not owner:
-            raise engine_mod.EngineError("credentials",
-                                         f"nobody has signed in to '{name}' yet; a person must run connect")
+            raise engine_mod.EngineError("credentials", f"no sign-in to '{name}' is lent to minds; a person "
+                                                        "lends theirs with connect and for_minds")
         return owner
     owner = _principal(ctx)
     if not store.has_credentials(name, owner):
@@ -479,9 +479,9 @@ def _signin_text(swarm: str, store, name: str, record: dict) -> str:
         state = f"{len(people)} {'person' if len(people) == 1 else 'people'} signed in"
         if minds in people:
             account = engine_mod.clean_text(people[minds].get("account"), 120)
-            state += f"; minds use the sign-in of {minds}" + (f", as {account}" if account else "")
+            state += f"; lent to minds by {minds}" + (f", as {account}" if account else "")
         else:
-            state += "; none for minds"
+            state += "; none lent to minds"
     started = sorted(by for (s, n, by) in list(_PENDING_SIGNINS) if (s, n) == (swarm, name))
     if started:
         state += f"; a sign-in started by {', '.join(started)} is in progress"
@@ -972,10 +972,20 @@ async def _connect(ctx, swarm, store, items, params):
     key = (swarm, record["name"], person)
     if params.get("redirect_url") is not None:
         return await _finish_browser_signin(swarm, store, record, person, actor, str(params["redirect_url"]))
+    for_minds = params.get("for_minds", False)
+    if not isinstance(for_minds, bool):
+        return _refused("for_minds is true (lend your sign-in to the swarm's minds) or false")
+    if for_minds and store.lend(record["name"], person):
+        # Lent on purpose, through the host's confirm: the person is already signed in.
+        account = engine_mod.clean_text((store.credentials(record["name"], person) or {}).get("account"), 120)
+        store.trace({"action": "connect", "server": record["name"], "tool": None, "actor": actor,
+                     "status": "lent"})
+        return _result("done", f"your sign-in to '{record['name']}'" + (f" ({account})" if account else "") +
+                       " is now the one the swarm's minds use")
     flow = params.get("flow", "device")
     if flow == "browser":
         signin = oauth_mod.start_browser_flow(auth["tenant"], auth["client_id"], auth["scopes"])
-        pending = {"by": person, "browser": signin}  # the address goes only to this person
+        pending = {"by": person, "browser": signin, "for_minds": for_minds}  # the address goes only to this person
         with _SIGNIN_LOCK:
             _PENDING_SIGNINS[key] = pending
 
@@ -1008,7 +1018,7 @@ async def _connect(ctx, swarm, store, items, params):
             # Close the old session before the new token is visible, so a call made
             # with the new token never lands on a session that is being closed.
             ENGINE.forget(swarm, record["name"])
-            store.put_credentials(record["name"], person, token, for_minds=True)  # minds use the latest
+            store.put_credentials(record["name"], person, token, for_minds=for_minds)
             store.trace({"action": "connect", "server": record["name"], "tool": None,
                          "actor": actor, "status": "done"})
         except Exception as exc:
@@ -1052,7 +1062,7 @@ async def _finish_browser_signin(swarm, store, record, person, actor, landed):
     token["person"] = person
     # As for the device code: close the old session before the new token is visible.
     ENGINE.forget(swarm, record["name"])
-    store.put_credentials(record["name"], person, token, for_minds=True)  # minds use the latest
+    store.put_credentials(record["name"], person, token, for_minds=pending.get("for_minds", False))
     with _SIGNIN_LOCK:
         if _PENDING_SIGNINS.get(key) is pending:
             _PENDING_SIGNINS.pop(key)
@@ -1062,8 +1072,8 @@ async def _finish_browser_signin(swarm, store, record, person, actor, landed):
 
 
 def _revoke(ctx, swarm, store, items, params):
-    """A person deletes their own sign-in; if it was the one minds used, minds have none until a
-    person signs in again."""
+    """A person deletes their own sign-in; if it was lent to the minds, they have none until a person
+    lends one again."""
     record, _ = _target(store, items, params, need_tool=False)
     person = _principal(ctx)
     for_minds = store.signins(record["name"])["minds"] == person
@@ -1073,4 +1083,4 @@ def _revoke(ctx, swarm, store, items, params):
                  "status": "done" if removed else "noop"})
     if not removed:
         return _result("done", "you had no sign-in to delete")
-    return _result("done", "your sign-in deleted" + ("; minds have none until a person signs in" if for_minds else ""))
+    return _result("done", "your sign-in deleted" + ("; minds have none until a person lends one" if for_minds else ""))

@@ -259,8 +259,8 @@ class Demo:
         """Authorization code with PKCE: the person signs in in a browser and pastes back the address it lands
         on. The sign-in address carries the tenant and client IDs in full, so it is opened, not printed,
         where a browser can be opened."""
-        self.call_line("connect", {"flow": "browser"}, [f"server:{SERVER_NAME}"])
-        started = self.person("connect", [f"server:{SERVER_NAME}"], {"flow": "browser"})
+        self.call_line("connect", {"flow": "browser", "for_minds": True}, [f"server:{SERVER_NAME}"])
+        started = self.person("connect", [f"server:{SERVER_NAME}"], {"flow": "browser", "for_minds": True})
         if started.get("status") != "needs_input":
             self.need(started, "connect", HINT)  # says why, then stops
         detail = started["detail"]
@@ -290,8 +290,9 @@ class Demo:
             self.say("The sign-in is still open: paste the address again, or sign in again from the same page.", 2)
 
     def device_code(self) -> None:
-        self.call_line("connect", {}, [f"server:{SERVER_NAME}"])
-        detail = self.need(self.person("connect", [f"server:{SERVER_NAME}"], {}), "connect", HINT)["detail"]
+        self.call_line("connect", {"for_minds": True}, [f"server:{SERVER_NAME}"])
+        detail = self.need(self.person("connect", [f"server:{SERVER_NAME}"], {"for_minds": True}), "connect",
+                           HINT)["detail"]
         self.say(f"Open    {detail['verification_uri']}", 2)
         self.say(f"Code    {detail['user_code']}", 2)
         self.say("Sign in with an account of the tenant and accept the permissions; the demo goes on by itself.", 2)

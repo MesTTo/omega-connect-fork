@@ -189,13 +189,17 @@ expires. The app registration needs that address as a redirect URI under
 Each person signs in for themselves: the app keeps every person's sign-in
 under their principal (`ctx.actor.principal`, such as `user:ada`), encrypted,
 and a person's own calls to the server use their own. One who has not signed
-in is told to run `connect`. The swarm's minds use the latest sign-in. The
-view says how many people signed in and whose sign-in the minds use, with its
-account (`preferred_username` from the id_token, kept only to show it; the
-id_token itself is not stored). `revoke` deletes only your own sign-in; if
-the minds used it, they have none until a person signs in again. A sign-in
-kept by an earlier version (one per server, naming no principal) counts as
-none: its person signs in again.
+in is told to run `connect`. A sign-in reaches the swarm's minds only when its
+person lends it on purpose: `connect` with `{"for_minds": true}`, confirmed
+like any `connect`, lends the person's sign-in, or, if they have none yet, the
+one it starts. One sign-in per server is lent at a time; lending another
+replaces it. A mind's call uses the lent sign-in, and with none lent it is
+refused. The view says how many people signed in and whose sign-in is lent,
+with its account (`preferred_username` from the id_token, kept only to show
+it; the id_token itself is not stored). `revoke` deletes only your own
+sign-in; if it was the lent one, minds have none until a person lends one
+again. A sign-in kept by an earlier version (one per server, naming no
+principal) counts as none: its person signs in again, and lends it.
 
 The parameter is `signin` rather than `auth` because the host refuses request
 bodies with credential-like keys.

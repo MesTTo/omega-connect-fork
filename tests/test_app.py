@@ -61,8 +61,10 @@ def redefine(hive, swarm, tool, description, read_only=True):
     assert out["status"] == "done", out
 
 
-def sign_in(hive, swarm, server, person=PERSON):
-    started = run(hive.person_act(swarm, person, "connect", [f"server:{server}"], {}, confirmed=True))
+def sign_in(hive, swarm, server, person=PERSON, for_minds=True):
+    """A person signs in with the device code, and by default lends the sign-in to the swarm's minds."""
+    started = run(hive.person_act(swarm, person, "connect", [f"server:{server}"], {"for_minds": for_minds},
+                                  confirmed=True))
     store = hive.program.store_mod.SwarmStore(swarm)
     for _ in range(100):
         if store.has_credentials(server, f"user:{person}"):
@@ -771,7 +773,7 @@ def test_device_code_sign_in_and_revoke(hive, guarded_url, fake_authority, tmp_p
     assert add(hive, "s1", "m365", guarded_url, signin=SIGNIN)["status"] == "done"
     before = mind(hive, "s1", "read-tool", "k0", server="m365", tool="add", arguments={"a": 1, "b": 1})
     assert before["status"] == "error" and "connect" in before["message"]
-    started = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {}, confirmed=True))
+    started = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"for_minds": True}, confirmed=True))
     assert started["detail"]["user_code"] == "ABCD-1234" and "ABCD-1234" in started["message"]
     assert fake_authority.scopes == ["Mail.Read openid profile offline_access"]
     waiting = run(hive.view("s1", PERSON))
@@ -783,7 +785,7 @@ def test_device_code_sign_in_and_revoke(hive, guarded_url, fake_authority, tmp_p
         time.sleep(0.2)
     assert token_seen_by_forget == [False]  # the old session closed before the new token was visible
     signed = text_of(run(hive.view("s1", PERSON)), "server:m365")
-    assert f"Sign-in: oauth-device (1 person signed in; minds use the sign-in of user:{PERSON}, as {ACCOUNT})" \
+    assert f"Sign-in: oauth-device (1 person signed in; lent to minds by user:{PERSON}, as {ACCOUNT})" \
         in signed and "in progress" not in signed
     review(hive, "s1", "m365")
     after = mind(hive, "s1", "read-tool", "k1", server="m365", tool="add", arguments={"a": 20, "b": 22})
@@ -800,7 +802,7 @@ def test_device_code_sign_in_and_revoke(hive, guarded_url, fake_authority, tmp_p
 
 def test_each_person_signs_in_for_themselves(hive, token_server, fake_authority, tmp_path):
     """A person's sign-in is their own: it sits encrypted next to the others, their own calls use it, and
-    revoke deletes only it. Minds use the latest sign-in, and none once its person revokes it."""
+    revoke deletes only it; once the sign-in lent to minds is revoked, minds have none."""
     fake_authority.pending_polls = 0
     add(hive, "s1", "m365", token_server.url, signin=SIGNIN, timeout=5)
     sign_in(hive, "s1", "m365")  # ada, whose token is SECRET
@@ -823,16 +825,39 @@ def test_each_person_signs_in_for_themselves(hive, token_server, fake_authority,
     eve = add_as("eve")
     assert eve["status"] == "error" and "you have not signed in to 'm365'" in eve["message"]
     signed = text_of(run(hive.view("s1", PERSON)), "server:m365")
-    assert "2 people signed in; minds use the sign-in of user:bob" in signed  # the latest
+    assert "2 people signed in; lent to minds by user:bob" in signed  # the latest to lend theirs
     assert isinstance(mind(hive, "s1", "list-tools", "k1", server="m365")["detail"]["tools"]["m365"], list)
     revoked = run(hive.person_act("s1", "bob", "revoke", ["server:m365"], {}, confirmed=True))
-    assert revoked["message"] == "your sign-in deleted; minds have none until a person signs in"
+    assert revoked["message"] == "your sign-in deleted; minds have none until a person lends one"
     assert store.has_credentials("m365", f"user:{PERSON}") and not store.has_credentials("m365", "user:bob")
-    assert "1 person signed in; none for minds" in text_of(run(hive.view("s1", PERSON)), "server:m365")
+    assert "1 person signed in; none lent to minds" in text_of(run(hive.view("s1", PERSON)), "server:m365")
     listed = mind(hive, "s1", "list-tools", "k2", server="m365")["detail"]["tools"]["m365"]
-    assert "nobody has signed in" in listed["error"]
+    assert "no sign-in to 'm365' is lent to minds" in listed["error"]
     assert run(hive.person_act("s1", "eve", "revoke", ["server:m365"], {}, confirmed=True))["message"] \
         == "you had no sign-in to delete"
+
+
+def test_minds_use_only_a_sign_in_lent_to_them(hive, guarded_url, fake_authority):
+    """A sign-in is its person's own until they lend it to the swarm's minds on purpose (connect with
+    for_minds, confirmed), one at a time per server. Lending one's sign-in needs no new sign-in."""
+    fake_authority.pending_polls = 0
+    add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
+    sign_in(hive, "s1", "m365", for_minds=False)
+    listed = mind(hive, "s1", "list-tools", "k1", server="m365")["detail"]["tools"]["m365"]
+    assert "is lent to minds" in listed["error"]
+    assert "1 person signed in; none lent to minds" in text_of(run(hive.view("s1", PERSON)), "server:m365")
+    lent = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"for_minds": True}, confirmed=True))
+    assert lent["status"] == "done" and "is now the one the swarm's minds use" in lent["message"]
+    assert len(fake_authority.scopes) == 1  # no new sign-in
+    assert isinstance(mind(hive, "s1", "list-tools", "k2", server="m365")["detail"]["tools"]["m365"], list)
+    assert f"lent to minds by user:{PERSON}" in text_of(run(hive.view("s1", PERSON)), "server:m365")
+    sign_in(hive, "s1", "m365", person="bob")  # bob signs in and lends his: one lender at a time
+    assert "2 people signed in; lent to minds by user:bob" in text_of(run(hive.view("s1", PERSON)), "server:m365")
+    run(hive.person_act("s1", PERSON, "revoke", ["server:m365"], {}, confirmed=True))  # not the lent one
+    assert "1 person signed in; lent to minds by user:bob" in text_of(run(hive.view("s1", PERSON)), "server:m365")
+    assert isinstance(mind(hive, "s1", "list-tools", "k3", server="m365")["detail"]["tools"]["m365"], list)
+    odd = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"for_minds": "yes"}, confirmed=True))
+    assert odd["status"] == "refused"
 
 
 def test_sign_in_needs_an_encryption_key(hive, guarded_url, fake_authority, monkeypatch):
@@ -847,7 +872,8 @@ def test_browser_sign_in_with_pkce(hive, guarded_url, fake_authority, caplog, tm
     back the address their browser lands on, and the app trades its code and the PKCE verifier for tokens."""
     caplog.set_level(logging.DEBUG)
     assert add(hive, "s1", "m365", guarded_url, signin=SIGNIN)["status"] == "done"
-    started = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"flow": "browser"}, confirmed=True))
+    started = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"flow": "browser", "for_minds": True},
+                                  confirmed=True))
     assert started["status"] == "needs_input" and list(started["needs"]) == ["redirect_url"]
     address = urlsplit(started["detail"]["authorization_url"])
     query = {k: v[0] for k, v in parse_qs(address.query).items()}
@@ -865,7 +891,7 @@ def test_browser_sign_in_with_pkce(hive, guarded_url, fake_authority, caplog, tm
     [sent] = fake_authority.redemptions
     assert sent["redirect_uri"] == query["redirect_uri"] and len(sent["code_verifier"]) >= 43
     signed = text_of(run(hive.view("s1", PERSON)), "server:m365")
-    assert f"Sign-in: oauth-device (1 person signed in; minds use the sign-in of user:{PERSON}, as {ACCOUNT})" \
+    assert f"Sign-in: oauth-device (1 person signed in; lent to minds by user:{PERSON}, as {ACCOUNT})" \
         in signed and "in progress" not in signed
     review(hive, "s1", "m365")
     after = mind(hive, "s1", "read-tool", "k1", server="m365", tool="add", arguments={"a": 20, "b": 22})
@@ -999,7 +1025,7 @@ def test_a_renewal_that_ends_after_a_revoke_does_not_bring_the_token_back(hive, 
         renewing = pool.submit(mind, hive, "s1", "use-tool", "w1", approval_id, **call)
         time.sleep(0.3)  # the renewal is waiting for the identity provider
         revoked = run(hive.person_act("s1", PERSON, "revoke", ["server:m365"], {}, confirmed=True))
-        assert revoked["message"] == "your sign-in deleted; minds have none until a person signs in"
+        assert revoked["message"] == "your sign-in deleted; minds have none until a person lends one"
         result = renewing.result(timeout=30)
     assert result["status"] == "error" and "revoked" in result["message"]
     assert not hive.program.store_mod.SwarmStore("s1").has_credentials("m365")
