@@ -370,13 +370,12 @@ class Demo:
             what = f"{entry.get('action')} {entry.get('tool') or ''}".strip()
             line = f"{entry.get('at', '')[11:19]}  {what:<36} {entry.get('status', ''):<8} {entry.get('actor', '')}"
             if entry.get("record_id"):
-                try:
-                    approved = self.hive.record(entry["record_id"]).get("approved_by")
-                except StopIteration:
-                    approved = None
-                line += f"  {entry['record_id']}" + (f", approved by {approved}" if approved else "")
+                line += f"  {entry['record_id']}"
+            if entry.get("approved_by"):  # the approver the hive passed with the approval it redeemed
+                line += f", approved by {entry['approved_by']}"
             self.say(line, 2)
-        self.say("The trace keeps sha256 digests of arguments and results, never their content.", 2)
+        self.say("The trace keeps who approved each write and sha256 digests of arguments and results, "
+                 "never their content.", 2)
 
     def revoke_and_check(self) -> None:
         self.step("revoke and token check", "person, confirmed")

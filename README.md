@@ -96,7 +96,8 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
   returned as `{"untrusted": true, "text": ...}` and labelled as data, not
   instructions. Server-provided descriptions are cleaned and capped too.
 - **Every call is traced**: server, tool, digest of the arguments, digest of
-  the result, status, actor and the hive's record id for the act
+  the result, status, actor, who approved it and the approval's id
+  (`ctx.actor.approval`), and the hive's record id for the act
   (`ctx.command.record_id`). Content is never stored.
 - **Streamable HTTP by default.** `https://` only (plain `http` for localhost),
   no credentials in URLs. stdio servers start processes on the hive's machine
@@ -279,8 +280,8 @@ Grove, on 8051f30) answered each of them.
    approval it redeemed as `ctx.actor.approval = {id, binding_digest,
    approved_by}`, `approved_by` being the approver's principal; it is `None`
    when no person approved. `ctx.command` carries the request identity:
-   `idempotency_key` and `record_id`. Traces keep `record_id`, which ties each
-   call to the hive's own record of the act.
+   `idempotency_key` and `record_id`. Traces keep the approver, the approval's
+   id and `record_id`, which ties each call to the hive's own record of the act.
 4. **With the flagship team: which person a mind acts for.** Today a server
    uses the token of the person who last completed `connect`, and the view
    shows which account that is. Choosing a token per acting mind needs to know

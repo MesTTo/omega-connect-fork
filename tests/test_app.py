@@ -143,10 +143,14 @@ def test_use_tool_waits_for_a_person(hive, demo_url):
     # the approval was spent: a new request needs a new one
     again = mind(hive, "s1", "use-tool", "w2", server="demo", tool="create_note", arguments=args)
     assert again["status"] == "approval_required" and again["approval_id"] != first["approval_id"]
-    # the trace keeps the hive's record id, and that record names the approver
+    # the trace names who approved the write, from the approval the hive passed in ctx.actor.approval
     calls = [i["text"] for i in run(hive.view("s1", PERSON))["items"] if i["label"].startswith("use-tool")]
+    assert f"approved_by: user:{PERSON}" in calls[0]
     record_id = re.search(r"^record_id: (\S+)$", calls[0], re.M).group(1)
     assert hive.record(record_id)["approved_by"] == f"user:{PERSON}"
+    [traced] = [t for t in hive.program.store_mod.SwarmStore("s1").traces(10)
+                if t["action"] == "use-tool" and t["status"] == "done"]
+    assert traced["approved_by"] == f"user:{PERSON}" and traced["approval_id"] == first["approval_id"]
 
 
 def test_identical_retry_returns_the_recorded_result(hive, demo_url):
