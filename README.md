@@ -82,7 +82,9 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
 
 - **Credentials stay inside the app.** Bearer tokens come from operator
   variables named `OMEGA_CONNECT_CRED_<NAME>` (a server can never be pointed
-  at the hive's own secrets). OAuth tokens are encrypted at rest with Fernet
+  at the hive's own secrets), and each goes only to the addresses the operator
+  lists in `OMEGA_CONNECT_ORIGINS_<NAME>`, checked when a person adds a server
+  and before every call. OAuth tokens are encrypted at rest with Fernet
   and the key in `OMEGA_CONNECT_SECRET_KEY`; without that key the app refuses
   to store them. Tokens never appear in results, `view()`, traces, logs or
   errors: every outgoing text is scrubbed of the values tied to the server.
@@ -126,8 +128,10 @@ export HIVE_PLUGIN_DIRS=/path/to/omega-connect
 
 Optional settings: `OMEGA_CONNECT_DATA_DIR` (store, default `~/.omega-connect`),
 `OMEGA_CONNECT_LOG_DIR` (stderr of stdio servers), `OMEGA_CONNECT_ALLOW_STDIO=1`,
-`OMEGA_CONNECT_CRED_<NAME>` (bearer tokens), `OMEGA_CONNECT_OAUTH_AUTHORITY`
-(default `https://login.microsoftonline.com`).
+`OMEGA_CONNECT_CRED_<NAME>` (bearer tokens) with `OMEGA_CONNECT_ORIGINS_<NAME>`
+(the addresses each may go to, such as `https://api.githubcopilot.com`,
+space- or comma-separated), `OMEGA_CONNECT_OAUTH_AUTHORITY` (default
+`https://login.microsoftonline.com`).
 
 Then attach a mind, for example `read-tool` on allow and `use-tool` on ask,
 and add a server (below). `read-tool` runs only the tools a person has
@@ -135,7 +139,9 @@ accepted as reads.
 
 ## Add a server (person, confirmed)
 
-A GitHub-style server with a token the operator provides:
+A GitHub-style server with a token the operator provides, in
+`OMEGA_CONNECT_CRED_GITHUB`, for the address they list in
+`OMEGA_CONNECT_ORIGINS_GITHUB=https://api.githubcopilot.com`:
 
 ```json
 {"name": "github", "url": "https://api.githubcopilot.com/mcp/",
