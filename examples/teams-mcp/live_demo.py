@@ -24,6 +24,7 @@ import os
 import pathlib
 import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -119,12 +120,26 @@ class Processes:
 
 
 class Session:
-    """The operator acting as a person (with the host's confirm token, PROGRAMS.md 9d), and a mind acting
-    through the agent route."""
+    """A named person acting (with the host's confirm token, PROGRAMS.md 9d) and approving, and a mind acting
+    through the agent route.
+
+    use-tool declares approver "person" once each person signs in for themselves (N0g4D/omega-connect#12), and
+    the hive then takes neither an approval nor a use-tool from the local operator password. A scratch hive has
+    no Google sign-in, so the person is an admin written into the hive's database with a sign-in session, the
+    way the hive's own tests make a named person (hive/tests/test_google_connector_core.py, family_session).
+    """
 
     def __init__(self, procs: Processes):
         self.http = httpx.Client(base_url=procs.base, timeout=120)
-        token = self.http.post("/api/auth/login", json={"password": procs.password}).json()["token"]
+        self.http.post("/api/auth/login", json={"password": procs.password}).raise_for_status()  # the hive is up
+        token, person = secrets.token_urlsafe(32), f"u_demo{secrets.token_hex(4)}"
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with sqlite3.connect(procs.work / "hive-data" / "hive.db", timeout=30) as db:
+            db.execute("INSERT INTO people (id, email, name, role, invited_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                       (person, f"{person}@demo.example", "Demo person", "admin", "user:operator", now))
+            db.execute("INSERT INTO sessions (token_hash, created_at, kind, principal, expires_at, signin_hash) "
+                       "VALUES (?, ?, ?, ?, ?, ?)", (hashlib.sha256(token.encode()).hexdigest(), now, "sso",
+                                                     f"user:{person}", time.time() + 86400, None))
         self.headers = {"Authorization": f"Bearer {token}"}
         self.swarm = None
         self.actions = {}
@@ -221,7 +236,9 @@ def drive(procs: Processes, args, steps: Steps, answers: pathlib.Path | None) ->
     signin = {"kind": "oauth-device", "tenant": args.tenant, "client_id": args.client_id, "scopes": SCOPES}
     added = s.person("add-server", name="teams", url=f"http://127.0.0.1:{procs.teams_port}/mcp", signin=signin)
     steps.check("a person adds the Teams server", added.get("status") == "done", added.get("message"))
-    start = s.person("connect", ["server:teams"], flow="browser")
+    # for_minds lends the sign-in to the swarm's minds where each person signs in for themselves (#12); before
+    # that, the one sign-in is everyone's and the parameter is ignored.
+    start = s.person("connect", ["server:teams"], flow="browser", for_minds=True)
     if not steps.check("connect gives the person a Microsoft sign-in address", start.get("status") == "needs_input",
                        start.get("message")):
         return
