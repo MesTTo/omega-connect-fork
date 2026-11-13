@@ -257,9 +257,9 @@ def test_the_demo_reads_the_channel_and_posts_only_after_a_yes(start, platform):
     out = run.output
     for shown in ("Open    https://microsoft.com/devicelogin", f"Sign-in: oauth-device (signed in as {ACCOUNT})",
                   "read:  list_channels, list_teams, read_channel_messages", "write: post_channel_message",
-                  "Hi Bob, the demo is at 3pm", "The host holds request apr-1",
-                  "text     Test message from omega-connect", f"Posted in Teams as {ACCOUNT}",
-                  "approved by operator", "✓ No token", "Demo complete."):
+                  "Hi Bob, the demo is at 3pm", "The host answers approval_required: request apr-1",
+                  "text     Test message from omega-connect", "with the same key and approval_id apr-1",
+                  f"Posted in Teams as {ACCOUNT}", "approved by user:operator", "✓ No token", "Demo complete."):
         assert shown in out, shown
     for hidden in (TOKEN, REFRESH, ID_TOKEN, DEVICE_CODE, TENANT, CLIENT_ID, SHELL_KEY):
         assert hidden not in out

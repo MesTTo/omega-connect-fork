@@ -160,8 +160,8 @@ class Demo:
         self.outputs.append(result)
         return result
 
-    def mind(self, action: str, params: dict, key: str | None = None) -> dict:
-        result = run(self.hive.agent_act(SWARM, MIND, action, params, key or _key(action)))
+    def mind(self, action: str, params: dict, key: str | None = None, approval_id: str | None = None) -> dict:
+        result = run(self.hive.agent_act(SWARM, MIND, action, params, key or _key(action), approval_id))
         self.outputs.append(result)
         return result
 
@@ -331,11 +331,12 @@ class Demo:
         key = _key("use-tool")
         self.call_line("use-tool", params)
         waiting = self.mind("use-tool", params, key)
-        if waiting.get("status") != "pending_approval":
+        if waiting.get("status") != "approval_required":
             self.say(f"✗ Expected the request to wait for a person, got: {waiting.get('status')}", 2)
             raise Stop
-        approval = next(a for a in self.hive.pending() if a["mind"] == MIND and a["params"] == params)
-        self.say(f"⏸ The host holds request {approval['id']}, bound to these exact arguments; the mind waits.", 2)
+        approval = self.hive.approvals[waiting["approval_id"]]
+        self.say(f"⏸ The host answers approval_required: request {approval['id']}, bound to these exact arguments "
+                 "and this key. The mind waits.", 2)
         self.say(f"mind     {approval['mind']}", 4)
         self.say(f"action   {approval['action']} → {SERVER_NAME} / {params['tool']} (write)", 4)
         self.say(f"team     {team.get('name') or team['id']}", 4)
@@ -353,9 +354,11 @@ class Demo:
             self.say("✗ Not approved: the request stays pending, and nothing is posted.", 2)
             return
         self.hive.approve(approval["id"], PERSON)
-        self.say(f"✓ Approved by {PERSON}. The mind sends the request again, with the same key.", 2)
+        self.say(f"✓ Approved by {PERSON}. The mind sends the request again, with the same key and "
+                 f"approval_id {approval['id']}.", 2)
         self.call_line("use-tool", params)
-        posted = self.data(self.need(self.mind("use-tool", params, key), "use-tool", HINT)).get("posted") or {}
+        posted = self.data(self.need(self.mind("use-tool", params, key, approval["id"]), "use-tool",
+                                     HINT)).get("posted") or {}
         account = (self.store.credentials(SERVER_NAME) or {}).get("account") or "the account that signed in"
         self.say(f"✓ Posted in Teams as {account}: message {posted.get('id')}, {posted.get('at')}", 2)
         if posted.get("url"):
