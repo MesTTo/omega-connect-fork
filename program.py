@@ -176,6 +176,14 @@ def _actor_kind(ctx) -> str | None:
     return actor.get("kind") if isinstance(actor, dict) else getattr(actor, "kind", None)
 
 
+def _recovery(ctx) -> bool:
+    """ctx.actor.recovery: the hive delivers again an act it already recorded as done, with the
+    approval it first ran under, only so the caller hears its answer again; nothing is to be done
+    twice (PROGRAMS.md 9d for people; the agent route does the same for an identical retry)."""
+    actor = getattr(ctx, "actor", None)
+    return bool(actor.get("recovery") if isinstance(actor, dict) else getattr(actor, "recovery", False))
+
+
 def _intent_key(ctx, params: dict) -> str | None:
     command = getattr(ctx, "command", None)
     for source in (command, params):
@@ -692,8 +700,8 @@ async def _call_tool(ctx, swarm, store, action, items, params):
                 return earlier["result"]
     # An attempt that went out and kept no result left only this record, written just before the
     # call (below). The agent route sends no prior_failed, so the record is how a mind's write
-    # delivered again is known.
-    unknown = bool(earlier) or bool(_command(ctx, "prior_failed"))
+    # delivered again is known. A recovery is not such a delivery: the hive recorded the act as done.
+    unknown = not _recovery(ctx) and (bool(earlier) or bool(_command(ctx, "prior_failed")))
 
     def sending():
         if intent:
@@ -719,6 +727,13 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments, sending=
     trace = {"action": action, "server": record["name"], "tool": tool, "actor": _actor(ctx),
              "approved_by": approval.get("approved_by"), "approval_id": approval.get("id"),
              "record_id": _command(ctx, "record_id"), "arguments_digest": store_mod.digest(arguments)}
+    if action == "use-tool" and _recovery(ctx):
+        # A recovery reaches this point only when the app no longer keeps the act's answer
+        # (_call_tool returns it otherwise). The write may have gone out the first time, so it does
+        # not go out again.
+        store.trace({**trace, "status": "refused", "reason": "recovery-without-record"})
+        return _refused("this request was already carried out and its answer is no longer kept here; it is "
+                        "not run twice, and a new request runs it again", detail={"type": "recovery"}), False
     if action == "use-tool" and _actor_kind(ctx) == "mind" and not approval:
         # The brief: every write is approved by a person. A mind's rule can still say "allow", for
         # instance a pattern the owner wrote for its reads that also matches use-tool, so the app

@@ -115,7 +115,11 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
   the tool again and the result says the first attempt may already have taken
   effect (`detail.prior_failed: true`). The app needs its own record for this:
   the hive's agent route delivers a mind's failed attempt again with the same
-  `record_id` and no `ctx.command.prior_failed`.
+  `record_id` and no `ctx.command.prior_failed`. An identical retry of a write
+  the hive recorded as done comes back as a recovery (`ctx.actor.recovery`,
+  with the approval it first ran under): `use-tool` answers from its own
+  record, and if that record is gone it refuses (`detail.type: "recovery"`)
+  instead of running the tool a second time.
 
 ## Mount it in a hive
 
@@ -230,7 +234,7 @@ Behaviour that changes for a hive that ran 0.1.0:
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 58 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 59 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
@@ -242,8 +246,9 @@ contract notes and `hive/PROGRAMS.md`, and answers as
 `approval_required` with an `approval_id` that the mind sends back once a
 person approves, approvals bound to the exact request and its key and
 redeemed once, the approval in `ctx.actor.approval`, the hive's record id in
-`ctx.command`, failed attempts delivered again with the same record id and no
-`prior_failed`, `base_revision` added to params, read actions stored as
+`ctx.command`, an identical retry of a done act delivered again as a recovery
+with its original approval, failed attempts delivered again with the same
+record id and no `prior_failed`, `base_revision` added to params, read actions stored as
 digests only, confirm for people's actions, refusal of identity and
 credential keys.
 
@@ -260,7 +265,7 @@ Coverage against the brief's definition of done:
 | A read-classed tool through `read-tool` | `test_read_tool_runs_a_read_classed_tool` |
 | A write-classed tool refused through `read-tool` | `test_read_tool_refuses_a_write_classed_tool` |
 | `use-tool` waiting for approval | `test_use_tool_waits_for_a_person` |
-| An identical retry returning the recorded result | `test_identical_retry_returns_the_recorded_result`, `test_app_level_idempotency_also_holds` |
+| An identical retry returning the recorded result | `test_identical_retry_returns_the_recorded_result`, `test_app_level_idempotency_also_holds`, `test_an_identical_retry_is_a_recovery_that_runs_nothing_again` |
 | Tokens never in results, views or logs | `test_tokens_never_appear_in_results_views_traces_or_logs`, `test_device_code_sign_in_and_revoke`, `test_browser_sign_in_with_pkce` |
 | `programs_check` passes | COMPATIBLE with the pre-release copy: `cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-connect`. It sees only an empty view, so `test_contract.py` checks fuller views and every result with the hive's validators |
 | Live demo: read a Teams channel, then a write a person approves | run on a real tenant with `examples/teams-mcp/demo.py`, in the repository's fake hive (13 Nov 2026: the channel read, a message posted once approved); on a scratch hive still to do. `test_demo.py` and the last test of `test_server.py` rehearse it offline |

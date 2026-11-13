@@ -1,8 +1,11 @@
 """A small stand-in for the OmegaHive host, for offline tests.
 
 It follows program contract 0.2 as described publicly (omegahive-schematics,
-06-apps/01-programs-contract.md) and in hive/PROGRAMS.md (omegahive 04fc3f2),
-and answers as hive/core/program_actions.py there does:
+06-apps/01-programs-contract.md) and in hive/PROGRAMS.md (omegahive 04fc3f2).
+The agent route answers as hive/core/program_actions.py on flagship main does
+(a private repository; the file is not in the 04fc3f2 copy): the approvals and
+the recovery below as MesTTo confirmed them against that file, prior_failed
+by MesTTo's reading of it. All of it is to verify on a scratch hive.
 
 - describe() is called synchronously; view() and act() may be async.
 - Minds act only through actions marked "agents": true, and only under an
@@ -13,8 +16,10 @@ and answers as hive/core/program_actions.py there does:
   with that approval_id. The host redeems it once, just before calling act(),
   and passes it as ctx.actor.approval = {id, binding_digest, approved_by},
   approved_by being the approver's principal.
-- A mind sends an idempotency key: an identical retry returns the recorded
-  result, a different request under the same key is refused (409).
+- A mind sends an idempotency key. An identical retry of an act already done
+  is delivered again as a recovery: act() gets the approval the act first ran
+  under (None under "allow") and ctx.actor.recovery = True, and is to deliver
+  nothing again. A different request under the same key is refused (409).
 - If act() raises, the effect is unknown. A retry under the same key is
   delivered again, after a new approval on "ask", with the same record_id and
   no ctx.command.prior_failed (the hive sets that on the person route only).
@@ -149,7 +154,17 @@ class FakeHive:
             if record["request"] != request:
                 raise HostRefusal(409, "idempotency_conflict")
             if record["status"] == "done" and record["effect"] != "read":
-                return record["result"]
+                # A recovery: act() gets the request again with the approval it first ran under and
+                # ctx.actor.recovery, and is to deliver nothing again. No new approval is asked for.
+                ctx = Ctx(swarm_id=swarm, actor={**mind_actor(swarm, mind, record["approval"]), "recovery": True},
+                          command={"idempotency_key": key, "record_id": record["id"], "route": "agent"})
+                try:
+                    result = await _maybe_await(self.program.act(ctx, action, [],
+                                                                 {**params, "base_revision": base_revision}))
+                except Exception as exc:
+                    raise HostRefusal(500, "program_error") from exc
+                self.check_result(result)
+                return result
         approval = None
         if mode == "ask":
             binding = canonical({"mind": mind, "action": action, "request": request, "idempotency_key": key})
@@ -175,6 +190,7 @@ class FakeHive:
             record = self.records[(mind, key)] = {"id": f"rec-{len(self.records) + 1}", "request": request,
                                                    "effect": spec.get("effect"), "status": None}
         command = {"idempotency_key": key, "record_id": record["id"], "route": "agent"}
+        record["approval"] = approval  # what a recovery of this act gets again
         record["approved_by"] = approval and approval["approved_by"]
         ctx = Ctx(swarm_id=swarm, actor=mind_actor(swarm, mind, approval), command=command,
                   read_only=spec.get("effect") == "read")

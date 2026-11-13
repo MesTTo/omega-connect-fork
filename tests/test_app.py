@@ -187,6 +187,35 @@ def test_identical_retry_returns_the_recorded_result(hive, demo_url):
     assert conflict.value.status == 409
 
 
+def test_an_identical_retry_is_a_recovery_that_runs_nothing_again(hive, demo_url, monkeypatch):
+    """The hive delivers an identical retry of a write it recorded as done as a recovery: act() gets
+    the approval the write first ran under and ctx.actor.recovery. The app answers from its own record;
+    once it no longer keeps that record, it still runs nothing, and says so."""
+    add(hive, "s1", "demo", demo_url)
+    review(hive, "s1", "demo")
+    note = {"server": "demo", "tool": "create_note", "arguments": {"title": "once", "text": "1"}}
+    approval_id = person_approves(hive, "s1", "w1", **note)
+    first = mind(hive, "s1", "use-tool", "w1", approval_id, **note)
+    assert first["status"] == "done"
+    run(hive.person_act("s1", PERSON, "use-tool", [], {"server": "demo", "tool": "delete_notes", "arguments": {}}))
+    actors, act = [], hive.program.act
+
+    async def recorded(ctx, action, items, params):
+        actors.append(dict(ctx.actor))
+        return await act(ctx, action, items, params)
+
+    monkeypatch.setattr(hive.program, "act", recorded)
+    assert mind(hive, "s1", "use-tool", "w1", **note) == first  # no new approval is asked for
+    assert actors[-1]["recovery"] is True and actors[-1]["approval"]["id"] == approval_id
+    store = hive.program.store_mod.SwarmStore("s1")
+    store.drop_intent("w1")  # the app no longer keeps the answer
+    again = mind(hive, "s1", "use-tool", "w1", **note)
+    assert again["status"] == "refused" and again["detail"]["type"] == "recovery"
+    assert store.traces(1)[0]["reason"] == "recovery-without-record"
+    notes = mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"]
+    assert notes == "(no notes)"  # neither retry wrote the note again
+
+
 def test_app_level_idempotency_also_holds(program, demo_url):
     """Defence in depth: the app keeps its own intent records for use-tool."""
     from fakehive import Ctx
