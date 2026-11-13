@@ -824,6 +824,40 @@ def test_a_browser_sign_in_finishes_only_with_its_own_address_for_its_own_person
     assert len(fake_authority.redemptions) == 1
 
 
+def test_an_unfinished_browser_sign_in_stops_showing_once_it_expires(hive, guarded_url, fake_authority, monkeypatch):
+    """A browser sign-in nobody finishes leaves the view when its address expires, as an expired device
+    code does, instead of staying "in progress" until the next connect."""
+    monkeypatch.setattr(hive.program.oauth_mod, "BROWSER_SIGNIN_SECONDS", 1)
+    add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
+    started = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"flow": "browser"}, confirmed=True))
+    assert "in progress" in text_of(run(hive.view("s1", PERSON)), "server:m365")
+    for _ in range(50):
+        if "in progress" not in text_of(run(hive.view("s1", PERSON)), "server:m365"):
+            break
+        time.sleep(0.1)
+    assert "Sign-in: oauth-device (not signed in)" in text_of(run(hive.view("s1", PERSON)), "server:m365")
+    landed = fake_authority.authorize(started["detail"]["authorization_url"])
+    late = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"redirect_url": landed}, confirmed=True))
+    assert late["status"] == "refused" and fake_authority.redemptions == []
+
+
+def test_finishing_a_browser_sign_in_is_not_stale(hive, guarded_url, fake_authority):
+    """The connect that starts a browser sign-in changes the page (a sign-in in progress), so the one that
+    finishes it comes with an old base revision; it decides nothing from the page and goes through. Every
+    other connect still needs the page the person saw."""
+    add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
+    seen = run(hive.view("s1", PERSON))["revision"]
+
+    def connect(**params):
+        return run(hive.person_act("s1", PERSON, "connect", ["server:m365"], params, confirmed=True, base_revision=seen))
+
+    started = connect(flow="browser")
+    assert started["status"] == "needs_input" and run(hive.view("s1", PERSON))["revision"] != seen
+    assert connect(flow="browser")["status"] == "stale"
+    landed = fake_authority.authorize(started["detail"]["authorization_url"])
+    assert connect(redirect_url=landed)["status"] == "done"
+
+
 # ------------------------------------------------------------------ token renewal
 # These calls go through use-tool, each approved by a person first: they are about tokens, not about classes.
 

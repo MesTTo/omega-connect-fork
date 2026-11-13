@@ -175,9 +175,11 @@ the result gives the person an address to open (authorization code with
 PKCE). After they sign in, the browser lands on
 `https://login.microsoftonline.com/common/oauth2/nativeclient?code=...`, an
 empty page. They run `connect` again with that whole address as
-`redirect_url`, within ten minutes, and only they can finish it. The app
-registration needs that address as a redirect URI under *Mobile and desktop
-applications*.
+`redirect_url`, within ten minutes, and only they can finish it; that
+second `connect` needs no current `base_revision`, since the first one
+changed the page. A sign-in nobody finishes leaves the view when it
+expires. The app registration needs that address as a redirect URI under
+*Mobile and desktop applications*.
 
 Either way, the view then shows the account that
 signed in (`preferred_username` from the id_token, kept only to show it; the
@@ -234,7 +236,7 @@ Behaviour that changes for a hive that ran 0.1.0:
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 59 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 61 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
@@ -281,7 +283,7 @@ Coverage of the first review's changes:
 | `accept-reads` applies to the definitions the person saw | `test_accepting_reads_needs_the_page_the_person_saw` |
 | A call goes out only on the definition it was classed by | `test_a_call_goes_out_only_on_the_definition_it_was_checked_against` (engine) |
 | The device code only in the `connect` result; the view shows the account that signed in | `test_device_code_sign_in_and_revoke` |
-| Browser sign-in with PKCE for tenants that block the device code; only its own address and person finish it | `test_browser_sign_in_with_pkce`, `test_a_browser_sign_in_finishes_only_with_its_own_address_for_its_own_person` |
+| Browser sign-in with PKCE for tenants that block the device code; only its own address and person finish it; it leaves the view when it expires, and finishing it is never stale | `test_browser_sign_in_with_pkce`, `test_a_browser_sign_in_finishes_only_with_its_own_address_for_its_own_person`, `test_an_unfinished_browser_sign_in_stops_showing_once_it_expires`, `test_finishing_a_browser_sign_in_is_not_stale` |
 | Token renewal: off the event loop, once at a time per server, never over a revoke | `test_a_token_renewal_does_not_block_the_event_loop`, `test_calls_on_several_loops_renew_the_token_once`, `test_a_renewal_that_ends_after_a_revoke_does_not_bring_the_token_back` |
 | A renewed token opens a new session; the call running on the old one finishes | `test_a_renewed_token_opens_a_new_session`, `test_a_call_running_when_the_token_is_renewed_finishes_on_its_session` |
 

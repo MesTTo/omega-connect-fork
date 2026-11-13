@@ -600,7 +600,10 @@ async def act(ctx, action, items, params):
             return await _call_tool(ctx, swarm, store, action, items, params)
         if action in ("add-server", "remove-server", "accept-reads", "reclass-tool", "connect", "revoke"):
             base = params.get("base_revision")
-            if base is not None and base != _revision(swarm, store):
+            # Finishing one's own browser sign-in decides nothing from the page, and the connect that
+            # started it changed the page (a sign-in in progress), so its base is always an old one.
+            finishing = action == "connect" and params.get("redirect_url") is not None
+            if base is not None and base != _revision(swarm, store) and not finishing:
                 return _result("stale", "the page changed; look again before changing servers",
                                graph=view(ctx, None, "unfold"))
             handler = {"add-server": _add_server, "remove-server": _remove_server, "accept-reads": _accept_reads,
@@ -932,8 +935,18 @@ async def _connect(ctx, swarm, store, items, params):
     flow = params.get("flow", "device")
     if flow == "browser":
         signin = oauth_mod.start_browser_flow(auth["tenant"], auth["client_id"], auth["scopes"])
+        pending = {"by": person, "browser": signin}  # the address goes only to this person
         with _SIGNIN_LOCK:
-            _PENDING_SIGNINS[key] = {"by": person, "browser": signin}  # the address goes only to this person
+            _PENDING_SIGNINS[key] = pending
+
+        def expire():  # as the device code's thread does when its code expires
+            with _SIGNIN_LOCK:
+                if _PENDING_SIGNINS.get(key) is pending:  # not a later connect's
+                    _PENDING_SIGNINS.pop(key)
+
+        timer = threading.Timer(max(signin.expires_at - time.time(), 0), expire)
+        timer.daemon = True
+        timer.start()
         return _result("needs_input",
                        f"Open {signin.url} and sign in. Your browser then lands on an address starting with "
                        f"{signin.redirect_uri} (the page stays empty). Run connect again with that whole address "

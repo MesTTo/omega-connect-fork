@@ -89,7 +89,7 @@ can finish it.
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests            # 59 tests, ~60 s, localhost only
+python -m pytest -q tests            # 61 tests, ~65 s, localhost only
 python -m pytest -q examples/teams-mcp   # 30 tests, ~13 s, Graph simulated in memory
 ```
 
