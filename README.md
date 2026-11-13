@@ -186,10 +186,16 @@ changed the page. A sign-in nobody finishes leaves the view when it
 expires. The app registration needs that address as a redirect URI under
 *Mobile and desktop applications*.
 
-Either way, the view then shows the account that
-signed in (`preferred_username` from the id_token, kept only to show it; the
-id_token itself is not stored), which is the account every mind in the swarm
-acts as on that server. `revoke` deletes the token.
+Each person signs in for themselves: the app keeps every person's sign-in
+under their principal (`ctx.actor.principal`, such as `user:ada`), encrypted,
+and a person's own calls to the server use their own. One who has not signed
+in is told to run `connect`. The swarm's minds use the latest sign-in. The
+view says how many people signed in and whose sign-in the minds use, with its
+account (`preferred_username` from the id_token, kept only to show it; the
+id_token itself is not stored). `revoke` deletes only your own sign-in; if
+the minds used it, they have none until a person signs in again. A sign-in
+kept by an earlier version (one per server, naming no principal) counts as
+none: its person signs in again.
 
 The parameter is `signin` rather than `auth` because the host refuses request
 bodies with credential-like keys.

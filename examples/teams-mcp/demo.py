@@ -147,10 +147,11 @@ class Demo:
         """Terminal controls dropped, and the token values of the sign-in (the current ones and any
         seen before) replaced."""
         try:
-            token = self.store.credentials(SERVER_NAME) or {}
+            tokens = self.store.signins(SERVER_NAME)["people"].values()
         except self.program.store_mod.StoreError:
-            token = {}
-        self.secrets.update(value for value in (token.get("access_token"), token.get("refresh_token")) if value)
+            tokens = ()
+        for token in tokens:
+            self.secrets.update(value for value in (token.get("access_token"), token.get("refresh_token")) if value)
         text = UNSAFE.sub("", str(text))
         for secret in self.secrets:
             text = text.replace(secret, "[token removed]")
@@ -421,7 +422,8 @@ class Demo:
         self.call_line("use-tool", params)
         posted = self.data(self.need(self.mind("use-tool", params, key, approval["id"]), "use-tool",
                                      HINT)).get("posted") or {}
-        account = (self.store.credentials(SERVER_NAME) or {}).get("account") or "the account that signed in"
+        signins = self.store.signins(SERVER_NAME)
+        account = (signins["people"].get(signins["minds"]) or {}).get("account") or "the account that signed in"
         self.say(f"✓ Posted in Teams as {account}: message {posted.get('id')}, {posted.get('at')}", 2)
         if posted.get("url"):
             self.say(posted["url"], 4)

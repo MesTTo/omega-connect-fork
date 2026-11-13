@@ -432,7 +432,8 @@ def test_the_demo_through_omega_connect(program, url, graph, tmp_path, monkeypat
     assert asked[0] == (f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode",
                         " ".join(SCOPES + ["openid", "profile", "offline_access"]))
     server_item = next(i for i in run(hive.view(SWARM, PERSON))["items"] if i["id"] == "server:teams")
-    assert "signed in as ada@omegademo.example" in server_item["text"] and "ABCD-1234" not in server_item["text"]
+    assert "minds use the sign-in of user:ada, as ada@omegademo.example" in server_item["text"]
+    assert "ABCD-1234" not in server_item["text"]
 
     tools = mind("list-tools", "k1", server="teams")["detail"]["tools"]["teams"]
     assert {tool["name"]: tool["class"] for tool in tools} == dict.fromkeys(
