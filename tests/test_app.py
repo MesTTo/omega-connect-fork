@@ -571,6 +571,35 @@ def test_bad_arguments(hive, demo_url):
     assert mind(hive, "s1", "read-tool", "k2", server="demo", tool="nope")["status"] == "refused"
 
 
+def test_malformed_input_is_refused_not_a_500(hive, demo_url, monkeypatch):
+    monkeypatch.setenv("OMEGA_CONNECT_ALLOW_STDIO", "1")  # so the args case reaches its own check
+    signin = {"kind": "oauth-device", "tenant": "organizations", "client_id": "11111111-2222-3333-4444-555555555555"}
+    for params in ({"name": "a", "url": demo_url, "timeout": "soon"},
+                   {"name": "b", "url": demo_url, "signin": "a token, please"},
+                   {"name": "c", "url": demo_url, "signin": {**signin, "scopes": "Mail.Read"}},
+                   {"name": "d", "transport": "stdio", "command": "python3", "args": "server.py"}):
+        out = run(hive.person_act("s1", PERSON, "add-server", [], params, confirmed=True))
+        assert out["status"] == "refused", (params, out)
+    assert mind(hive, "s1", "list-servers", "k1")["detail"]["servers"] == []
+
+
+def test_an_unexpected_failure_is_an_error_result_except_in_use_tool(hive, demo_url, monkeypatch, caplog):
+    """The hive turns an exception into a 500 and an unknown outcome. That is right only where a call
+    may have gone out, so use-tool raises and everything else answers with an error."""
+    add(hive, "s1", "demo", demo_url)
+    store_cls = hive.program.store_mod.SwarmStore
+
+    def broken(self):
+        raise RuntimeError("Bearer tok-leak-check")
+
+    monkeypatch.setattr(store_cls, "servers", broken)
+    listed = mind(hive, "s1", "list-servers", "k1")
+    assert listed["status"] == "error" and listed["detail"]["type"] == "internal"
+    assert "tok-leak-check" not in json.dumps(listed) + caplog.text  # the exception's text stays out
+    with pytest.raises(RuntimeError):  # the fake host's person route lets the exception through, as a 500 would
+        run(hive.person_act("s1", PERSON, "use-tool", [], {"server": "demo", "tool": "add", "arguments": {"a": 1, "b": 1}}))
+
+
 # ------------------------------------------------------------------ views
 
 def test_view_is_valid_and_stable_in_every_stage(hive, demo_url):

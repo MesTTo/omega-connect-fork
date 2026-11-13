@@ -601,6 +601,16 @@ async def act(ctx, action, items, params):
         return _refused(f"unknown action '{action}'")
     except (engine_mod.EngineError, store_mod.StoreError, oauth_mod.OAuthError) as exc:
         return _result("error", exc.message, detail={"type": exc.kind})
+    except Exception as exc:
+        if action == "use-tool":
+            # Its call may already have gone out. Raising tells the hive the outcome is unknown, so it
+            # keeps the act open and can deliver it again (PROGRAMS.md 9d), where an error result
+            # would record it as finished.
+            raise
+        # The type only: an exception's text can carry what a server sent back.
+        logger.error("omega-connect: %s failed with %s", action, type(exc).__name__)
+        return _result("error", f"{action} failed inside omega-connect ({type(exc).__name__})",
+                       detail={"type": "internal"})
 
 
 def _target(store, items, params, need_tool: bool):
@@ -794,14 +804,22 @@ def _add_server(ctx, swarm, store, items, params):
         if not command:
             return _refused("stdio needs a command")
         record["command"] = command
-        record["args"] = [str(a) for a in params.get("args", [])]
+        args = params.get("args", [])
+        if not isinstance(args, list):
+            return _refused("args is a list of strings")
+        record["args"] = [str(a) for a in args]
     else:
         return _refused("transport must be http or stdio")
     for key in ("timeout", "connect_timeout"):
         if key in params:
-            record[key] = max(1, min(int(params[key]), 600))
+            try:
+                record[key] = max(1, min(int(params[key]), 600))
+            except (TypeError, ValueError):
+                return _refused(f"{key} is a whole number of seconds, 1 to 600")
     # "signin" rather than "auth": the host refuses bodies with credential-like keys.
     auth = params.get("signin") or {"kind": "none"}
+    if not isinstance(auth, dict):
+        return _refused('signin is an object such as {"kind": "none"}')
     kind = auth.get("kind", "none")
     if kind == "bearer-env":
         variable = str(auth.get("variable", ""))
@@ -815,7 +833,10 @@ def _add_server(ctx, swarm, store, items, params):
     elif kind == "oauth-device":
         tenant = str(auth.get("tenant", "organizations"))
         client_id = str(auth.get("client_id", ""))
-        scopes = [str(s) for s in auth.get("scopes", [])]
+        scopes = auth.get("scopes", [])
+        if not isinstance(scopes, list):
+            return _refused('scopes is a list, such as ["Mail.Read"]')
+        scopes = [str(s) for s in scopes]
         if not re.fullmatch(r"[A-Za-z0-9.-]{1,100}", tenant) or not re.fullmatch(r"[0-9a-fA-F-]{36}", client_id):
             return _refused("oauth-device needs a tenant and an application (client) id")
         if not scopes:
