@@ -7,10 +7,11 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from conftest import ACCOUNT, DEMO, NEW_TOKEN, REFRESH, SECRET
+from conftest import ACCOUNT, AUTH_CODE, DEMO, NEW_TOKEN, REFRESH, SECRET
 from fakehive import FakeHive, HostRefusal, run, validate_graph
 
 PERSON = "person:ada"
@@ -548,6 +549,66 @@ def test_sign_in_needs_an_encryption_key(hive, guarded_url, fake_authority, monk
     monkeypatch.delenv("OMEGA_CONNECT_SECRET_KEY")
     result = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {}, confirmed=True))
     assert result["status"] == "error" and "OMEGA_CONNECT_SECRET_KEY" in result["message"]
+
+
+def test_browser_sign_in_with_pkce(hive, guarded_url, fake_authority, caplog, tmp_path):
+    """For tenants that block the device code: connect gives the person an address; they sign in and paste
+    back the address their browser lands on, and the app trades its code and the PKCE verifier for tokens."""
+    caplog.set_level(logging.DEBUG)
+    assert add(hive, "s1", "m365", guarded_url, signin=SIGNIN)["status"] == "done"
+    started = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"flow": "browser"}, confirmed=True))
+    assert started["status"] == "needs_input" and list(started["needs"]) == ["redirect_url"]
+    address = urlsplit(started["detail"]["authorization_url"])
+    query = {k: v[0] for k, v in parse_qs(address.query).items()}
+    assert address.path == "/organizations/oauth2/v2.0/authorize"
+    assert query["response_type"] == "code" and query["code_challenge_method"] == "S256"
+    assert query["scope"] == "Mail.Read openid profile offline_access"
+    assert query["redirect_uri"] == started["detail"]["redirect_uri"]
+    assert query["redirect_uri"].endswith("/common/oauth2/nativeclient")
+    waiting = run(hive.view("s1", PERSON))
+    assert query["state"] not in json.dumps(waiting)  # the address goes only to the person who ran connect
+    assert "not signed in; a sign-in started by" in text_of(waiting, "server:m365")
+    landed = fake_authority.authorize(started["detail"]["authorization_url"])
+    done = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"redirect_url": landed}, confirmed=True))
+    assert done["status"] == "done" and ACCOUNT in done["message"]
+    [sent] = fake_authority.redemptions
+    assert sent["redirect_uri"] == query["redirect_uri"] and len(sent["code_verifier"]) >= 43
+    signed = text_of(run(hive.view("s1", PERSON)), "server:m365")
+    assert f"Sign-in: oauth-device (signed in as {ACCOUNT})" in signed and "in progress" not in signed
+    review(hive, "s1", "m365")
+    after = mind(hive, "s1", "read-tool", "k1", server="m365", tool="add", arguments={"a": 20, "b": 22})
+    assert after["detail"]["result"]["text"] == "42"  # the token from the browser sign-in was sent
+    outputs = [started, done, run(hive.view("s1", PERSON)), after]
+    assert_no_secrets(outputs, tmp_path, caplog, SECRET, REFRESH, sent["code_verifier"], AUTH_CODE,
+                      *fake_authority.id_tokens)
+
+
+def test_a_browser_sign_in_finishes_only_with_its_own_address_for_its_own_person(hive, guarded_url, fake_authority):
+    add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
+
+    def connect(person, **params):
+        return run(hive.person_act("s1", person, "connect", ["server:m365"], params, confirmed=True))
+
+    assert connect(PERSON, flow="pigeon")["status"] == "refused"
+    assert connect(PERSON, redirect_url="https://login.microsoftonline.com/common/oauth2/nativeclient"
+                                        "?code=x&state=y")["status"] == "refused"  # nothing was started
+    started = connect(PERSON, flow="browser")
+    landed = fake_authority.authorize(started["detail"]["authorization_url"])
+    assert connect("person:eve", redirect_url=landed)["status"] == "refused"  # another person's sign-in
+    elsewhere = connect(PERSON, redirect_url=landed.replace("/common/oauth2/nativeclient", "/elsewhere"))
+    assert elsewhere["detail"]["type"] == "bad_redirect"
+    forged = connect(PERSON, redirect_url=re.sub(r"state=[^&]+", "state=forged", landed))
+    assert forged["detail"]["type"] == "state_mismatch"
+    declined = connect(PERSON, redirect_url=landed.split("?")[0] + "?error=access_denied&error_description=declined")
+    assert declined["status"] == "error" and "access_denied" in declined["message"]
+    assert fake_authority.redemptions == []  # none of these reached the token endpoint
+    assert connect(PERSON, redirect_url=landed)["status"] == "done"  # still open after the wrong ones
+    assert connect(PERSON, redirect_url=landed)["status"] == "refused"  # and finished once
+    late = connect(PERSON, flow="browser")
+    hive.program._PENDING_SIGNINS[("s1", "m365")]["browser"].expires_at = time.time() - 1
+    expired = connect(PERSON, redirect_url=fake_authority.authorize(late["detail"]["authorization_url"], "ac-2"))
+    assert expired["status"] == "refused" and "expired" in expired["message"]
+    assert len(fake_authority.redemptions) == 1
 
 
 # ------------------------------------------------------------------ token renewal

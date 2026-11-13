@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -10,7 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -100,6 +101,7 @@ SECRET = "tok-9f2c4b7e51d0a8"
 NEW_TOKEN = "tok-3e8a1c6f92b47d"  # what a refresh returns when a test asks for a new token
 REFRESH = "rt-55aa66bb"  # the first refresh token; the ones that follow start with it too
 ACCOUNT = "ada@contoso.example"
+AUTH_CODE = "ac-5d1e8b2f9a"  # what the browser sign-in's redirect address carries
 
 
 @pytest.fixture
@@ -152,6 +154,15 @@ class _FakeAuthority(BaseHTTPRequestHandler):
                 body = {"error": "authorization_pending"}
             else:
                 body = state.grant(state.access_token)
+        elif form.get("grant_type") == "authorization_code":
+            state.redemptions.append(form)
+            with state.lock:
+                issued = state.codes.pop(form.get("code"), None)  # each code works once
+            verifier = form.get("code_verifier", "").encode()
+            proof = base64.urlsafe_b64encode(hashlib.sha256(verifier).digest()).rstrip(b"=").decode()
+            body = state.grant(state.access_token) if issued == (proof, form.get("redirect_uri")) else \
+                {"error": "invalid_grant", "error_description": "AADSTS70008: the code, its verifier or the "
+                                                                "redirect address does not match"}
         elif form.get("grant_type") == "refresh_token":
             with state.lock:
                 state.refreshes += 1
@@ -185,6 +196,17 @@ class _Authority:
         self.scopes: list[str] = []  # scope of each device code request
         self.refresh_tokens: set[str] = set()  # the ones that still work
         self.id_tokens: list[str] = []
+        # browser sign-in: code -> (PKCE challenge, redirect address) it was issued for; what each redemption sent
+        self.codes: dict[str, tuple[str, str]] = {}
+        self.redemptions: list[dict] = []
+
+    def authorize(self, address: str, code: str = AUTH_CODE) -> str:
+        """The person signs in at the authorization address and consents: the identity platform issues
+        a code for its challenge, and the browser lands on the redirect address with that code."""
+        query = {k: v[0] for k, v in parse_qs(urlsplit(address).query).items()}
+        with self.lock:
+            self.codes[code] = (query["code_challenge"], query["redirect_uri"])
+        return f"{query['redirect_uri']}?code={code}&state={query['state']}&session_state=s-1"
 
     def grant(self, access_token: str) -> dict:
         with self.lock:

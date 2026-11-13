@@ -63,7 +63,9 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
   servers.json (no secrets; the tools a person accepted as read, with the
   digest of each definition), secrets.bin (Fernet), trace.jsonl (digests),
   intents.json (app-level idempotency for use-tool). Files mode 0600.
-- `connect/oauth.py`: RFC 8628 device flow, standard library only; authority
+- `connect/oauth.py`: RFC 8628 device flow, and authorization code with PKCE
+  (RFC 7636) finished by the address the browser lands on, for tenants that
+  block the device code; standard library only; authority
   overridable with `OMEGA_CONNECT_OAUTH_AUTHORITY` (tests use a fake). Keeps
   only `preferred_username` from the id_token, to show who signed in.
   Renewal runs in a thread under a lock per (swarm, server), in program.py.
@@ -76,13 +78,15 @@ accepted that tool with `accept-reads` (people only, confirm), and its
 definition digest still matches the accepted one; every tool of a new server
 is write until then. The owner can demote (write, hidden, back to default),
 never promote. The digest catches definition changes, not behaviour changes.
-The device code goes only into the `connect` result, never into `view()`.
+The device code and the browser sign-in address go only into the `connect`
+result, never into `view()`; only the person who started a browser sign-in
+can finish it.
 
 ## Commands
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests            # 47 tests, ~55 s, localhost only
+python -m pytest -q tests            # 49 tests, ~55 s, localhost only
 python -m pytest -q examples/teams-mcp   # 24 tests, ~2 s, Graph simulated in memory
 ```
 

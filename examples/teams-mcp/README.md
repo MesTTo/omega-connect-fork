@@ -42,7 +42,10 @@ get its own Graph token (on-behalf-of flow).
    account that is a member of it.
 2. **App registration** (Entra admin center, App registrations, New):
    - single tenant; note the *Application (client) ID* and *Directory (tenant) ID*;
-   - Authentication: *Allow public client flows* = Yes (needed for the device code);
+   - Authentication: *Allow public client flows* = Yes (needed for the device code),
+     and, for the browser sign-in, *Add a platform*, *Mobile and desktop
+     applications*, with `https://login.microsoftonline.com/common/oauth2/nativeclient`
+     ticked as a redirect URI;
    - API permissions, Microsoft Graph, delegated: `Team.ReadBasic.All`,
      `Channel.ReadBasic.All`, `ChannelMessage.Read.All`, `ChannelMessage.Send`.
      `ChannelMessage.Read.All` needs admin consent: *Grant admin consent* on the
@@ -82,6 +85,11 @@ and `https://microsoft.com/devicelogin`, to this person only: the app's view
 never shows the code. Sign in there with the tenant account and accept the
 permissions. The app finishes the sign-in by itself; the view then shows
 `Sign-in: oauth-device (signed in as <the account>)`.
+
+On a tenant whose security defaults block the device code, run connect with
+`{"flow": "browser"}` instead. Open the address in the result, sign in and
+accept, then copy the address of the empty page the browser lands on and run
+connect again with `{"redirect_url": "<that address>"}`.
 
 **3. list-tools** (mind) with `{"server": "teams"}`. Every tool is `write` for
 now: the three Graph reads carry `"review": "not reviewed"`, because a
