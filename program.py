@@ -76,7 +76,8 @@ ACCEPTED, CHANGED, UNREVIEWED = "accepted", "changed since review", "not reviewe
 # Added to every oauth-device sign-in: openid and profile bring an id_token naming who signed in,
 # offline_access a refresh token.
 IDENTITY_SCOPES = ("openid", "profile", "offline_access")
-MAX_TOOLS_IN_VIEW = 300
+# The host refuses a view with more items than this (hive/core/programs.py, MAX_ITEMS).
+MAX_ITEMS_IN_VIEW = 400
 MAX_CALLS_IN_VIEW = 30
 _PENDING_SIGNINS: dict[tuple[str, str], dict] = {}  # who started a sign-in; never its code
 _SIGNIN_LOCK = threading.Lock()
@@ -202,7 +203,10 @@ def _safe_url(url: str | None) -> str:
         return ""
     parts = urlsplit(url)
     host = parts.hostname or ""
-    port = f":{parts.port}" if parts.port else ""
+    try:
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:  # a port that is not a number, kept by a version that did not refuse one
+        return "(not a valid address)"
     return f"{parts.scheme}://{host}{port}{parts.path}"
 
 
@@ -463,28 +467,51 @@ def _revision(swarm: str, store) -> str:
     return "r-" + store_mod.digest(state)[7:23]
 
 
+def _fair_shares(wanted: dict[str, int], room: int) -> dict[str, int]:
+    """Split `room` view items among servers that have `wanted[name]` tools each: every server gets
+    an even share, and what one doesn't need goes to the others (max-min fair).
+    Time: s log s, s = number of servers."""
+    shares, left = {}, max(room, 0)
+    names = sorted(wanted, key=lambda name: (wanted[name], name))
+    for index, name in enumerate(names):
+        shares[name] = min(wanted[name], left // (len(names) - index))
+        left -= shares[name]
+    return shares
+
+
 def view(ctx, focus, stage):
     swarm = _swarm(ctx)
     store = store_mod.SwarmStore(swarm)
     servers = store.servers()
     items, links, groups = [], [], []
     reviews = set()
-    for name, record in sorted(servers.items()):
+    traces = store.traces(MAX_CALLS_IN_VIEW)
+    # Servers first, then the recent calls, then tools in the room left: the host refuses the whole
+    # view past MAX_ITEMS_IN_VIEW, and list-tools still lists every tool.
+    shown = sorted(servers.items())[:max(MAX_ITEMS_IN_VIEW - len(traces), 0)]
+    loaded = {}
+    for name, _ in shown:
+        worker = ENGINE.peek(swarm, name)
+        loaded[name] = sorted(worker.tools.values(), key=lambda t: t.name) if worker else []
+    shares = _fair_shares({name: len(tools) for name, tools in loaded.items()},
+                          MAX_ITEMS_IN_VIEW - len(shown) - len(traces))
+    left_out = {name: (shares[name], len(tools)) for name, tools in loaded.items() if shares[name] < len(tools)}
+    for name, record in shown:
         status = _server_status(swarm, record)
         lines = [f"Transport: {record.get('transport', 'http')}",
                  f"Address: {_safe_url(record.get('url')) or record.get('command', '')}",
                  _signin_text(swarm, store, name, record),
                  f"Status: {status['status']}"]
+        if name in left_out:
+            shown_count, total = left_out[name]
+            lines.append(f"Tools shown: {shown_count} of {total}")
         if status.get("last_error"):
             lines.append(f"Last error: {status['last_error']}")
         if record.get("description"):
             lines.append(record["description"])
         items.append({"id": f"server:{name}", "kind": "server", "label": name, "text": "\n".join(lines)})
-        worker = ENGINE.peek(swarm, name)
         tool_ids = []
-        for tool in sorted(worker.tools.values(), key=lambda t: t.name) if worker else []:
-            if len(tool_ids) >= MAX_TOOLS_IN_VIEW:
-                break
+        for tool in loaded[name][:shares[name]]:
             cls, review = _classify(record, tool), _review(record, tool)
             reviews.add(review)
             tid = f"tool:{name}/{tool.name}"
@@ -500,7 +527,7 @@ def view(ctx, focus, stage):
         groups.append({"id": f"tools-{name}", "label": f"Tools of {name}", "items": [f"server:{name}"] + tool_ids})
     call_ids = []
     known = {item["id"] for item in items}
-    for index, entry in enumerate(store.traces(MAX_CALLS_IN_VIEW)):
+    for index, entry in enumerate(traces):
         cid = f"call:{entry.get('at', '')}:{index}"
         call_ids.append(cid)
         target = f"{entry.get('server')}/{entry['tool']}" if entry.get("tool") else str(entry.get("server"))
@@ -535,6 +562,12 @@ def view(ctx, focus, stage):
     if UNREVIEWED in reviews:
         graph["notes"].insert(0, "Tools that a server marks read-only count as write until a person "
                                  "accepts them (accept-reads, for a whole server or one tool).")
+    if left_out:
+        graph["notes"].insert(0, "Not every tool fits the screen's 400 items: " + "; ".join(
+            f"{name} shows {shown_count} of {total}" for name, (shown_count, total) in sorted(left_out.items()))
+            + ". list-tools lists them all.")
+    if len(shown) < len(servers):
+        graph["notes"].insert(0, f"{len(shown)} of {len(servers)} servers are shown; list-servers lists them all.")
     if not servers:
         graph["notes"].insert(0, "No servers yet. A person can add one with add-server.")
     elif any(ENGINE.peek(swarm, n) is None for n in servers):
@@ -744,6 +777,10 @@ def _add_server(ctx, swarm, store, items, params):
     if transport == "http":
         url = str(params.get("url", "")).strip()
         parts = urlsplit(url)
+        try:
+            parts.port
+        except ValueError:
+            return _refused("url has a port that is not a number")
         local = parts.hostname in ("127.0.0.1", "localhost", "::1")
         if parts.scheme != "https" and not (parts.scheme == "http" and local):
             return _refused("url must be https:// (plain http only for localhost)")

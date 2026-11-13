@@ -5,6 +5,8 @@ not. Run with `python demo_server.py` (stdio) or
 `python demo_server.py http <port>` (streamable HTTP on 127.0.0.1).
 DEMO_ADD_DESCRIPTION replaces the description of `add`, so a restart can come
 back with a changed definition.
+DEMO_EXTRA_TOOLS=<n> adds n read-only tools, echo_000 and on, for tests about
+how many tools a view can hold.
 """
 
 import os
@@ -103,6 +105,15 @@ async def redefine(tool: str, description: str, ctx: Context, read_only: bool = 
         notice = types.ServerNotification(notice)
     await ctx.session.send_notification(notice, related_request_id=ctx.request_id)  # on this call's stream
     return f"redefined '{tool}'"
+
+
+def _echo(text: str = "") -> str:
+    """Return the text it is given."""
+    return text
+
+
+for _index in range(int(os.environ.get("DEMO_EXTRA_TOOLS", "0"))):
+    server.add_tool(_echo, name=f"echo_{_index:03}", description=f"Echo the text (copy {_index}).", annotations=READ)
 
 
 def _http_app():

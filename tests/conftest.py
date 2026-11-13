@@ -81,6 +81,15 @@ def demo_url():
 
 
 @pytest.fixture
+def wide_demo():
+    """Demo server with 250 extra read-only tools."""
+    proc, url = _start_demo({"DEMO_EXTRA_TOOLS": "250"})
+    yield url
+    proc.terminate()
+    proc.wait(timeout=10)
+
+
+@pytest.fixture
 def restartable_demo():
     """Demo server that a test can restart on the same address, with other settings."""
     proc, url = _start_demo({})
