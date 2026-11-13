@@ -11,7 +11,8 @@ program contract 0.2 as described in
 [omegahive-schematics](https://github.com/omega-flagship/omegahive-schematics)
 (`06-apps/`). Apache-2.0.
 
-**Status: 0.1.0, first working version.** All actions work against real MCP
+**Status: 0.2.0**, the first working version with the changes from the first
+review ([Changes in 0.2.0](#changes-in-020)). All actions work against real MCP
 servers over streamable HTTP and stdio, and the offline tests pass.
 `hive.programs_check` from a pre-release copy of omegahive (04fc3f2) reports it
 compatible. The contract fixture is not in that copy; the omegahive repository
@@ -123,8 +124,9 @@ Optional settings: `OMEGA_CONNECT_DATA_DIR` (store, default `~/.omega-connect`),
 `OMEGA_CONNECT_CRED_<NAME>` (bearer tokens), `OMEGA_CONNECT_OAUTH_AUTHORITY`
 (default `https://login.microsoftonline.com`).
 
-Then attach a mind, for example `read-tool` on allow and `use-tool` on ask.
-`read-tool` runs only the tools a person has accepted as reads (above).
+Then attach a mind, for example `read-tool` on allow and `use-tool` on ask,
+and add a server (below). `read-tool` runs only the tools a person has
+accepted as reads.
 
 ## Add a server (person, confirmed)
 
@@ -157,6 +159,49 @@ acts as on that server. `revoke` deletes the token.
 
 The parameter is `signin` rather than `auth` because the host refuses request
 bodies with credential-like keys.
+
+Then accept the server's reads. Until a person does, every tool of the new
+server is `write`, so `read-tool` runs none of them:
+
+1. `list-tools` on the server (by a person, or a mind allowed to) loads its
+   tools into the view. For an `oauth-device` server, run `connect` first.
+2. A person looks at the tools in the view and runs `accept-reads`
+   (confirmed) on `server:<name>`, which accepts every tool the server marks
+   read-only, or on one `tool:<name>/<tool>`.
+
+If an accepted tool's definition changes later, the view says *changed since
+review* and the tool is `write` until a person accepts it again (see "Reads
+are reviewed by a person").
+
+## Changes in 0.2.0
+
+Behaviour that changes for a hive that ran 0.1.0:
+
+- **Reads need a person.** A tool runs through `read-tool` only once a person
+  has accepted it with `accept-reads`, a new people-only action. Servers added
+  under 0.1.0 are no exception: after the upgrade their tools are `write`
+  until someone accepts their reads.
+- **`reclass-tool` only makes a tool stricter:** it takes `write`, `hidden` or
+  `default` and refuses `read`. A `read` reclass stored by 0.1.0 is ignored.
+- **A changed definition loses its review:** the tool is `write` again, with
+  *changed since review* in the view. The tool list is loaded again on
+  `notifications/tools/list_changed` and on every new session.
+- **A restarted server gets a new session.** 0.1.0 stayed on the dead session
+  and every call failed with "Session not found" (or "Session terminated").
+- **`list-tools` and `inspect-tool`** give each tool a `review` field
+  (`accepted`, `not reviewed`, `changed since review`); a `read-tool` refusal
+  carries it in `detail.review`.
+- **Sign-in:** the device code is only in the `connect` result, no longer in
+  the view, which shows the account that signed in instead. New
+  `oauth-device` servers also ask for `openid` and `profile`; a server added
+  under 0.1.0 keeps its scopes, so its view says only "signed in" until it is
+  removed and added again.
+- **Token renewal** runs in a thread, one at a time per server, and the
+  renewed token opens a new MCP session; a call already running finishes on
+  the old one.
+- **Requirements:** `mcp>=1.30,<3` (was `mcp>=1.10`). 1.30 is the lowest
+  version the tests have run with; 1.10 does not even import with pydantic
+  2.12 or later.
 
 ## Tests
 

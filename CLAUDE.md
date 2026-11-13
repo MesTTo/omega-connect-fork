@@ -57,7 +57,8 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
   SDK 1.x calls the message handler inside its receive loop). Every tool keeps
   a digest of its definition; `call(expect=digest)` sends nothing if the
   definition changed. New auth headers mean a new session; the old one
-  finishes its calls (grace = call timeout). Supports MCP SDK 1.x and 2.x.
+  finishes its calls (grace = call timeout). Supports MCP SDK 1.x and 2.x:
+  `mcp>=1.30,<3`, 1.30 being the lowest version tested.
 - `connect/store.py`: per-swarm folder under `OMEGA_CONNECT_DATA_DIR`:
   servers.json (no secrets; the tools a person accepted as read, with the
   digest of each definition), secrets.bin (Fernet), trace.jsonl (digests),
@@ -105,12 +106,12 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
 
 1. Done (12 Nov 2026): `PROGRAMS.md` and `programs_check` came as a pre-release
    copy (`../omegahive-app-contract-04fc3f2`); the checker reports COMPATIBLE.
-   First review (Dot for Jon, on 8051f30) handled on branch `review-1` (13 Nov
-   2026): reads reviewed by a person, definition digests, device code only in
-   the connect result, locked token renewal, new session on a new token. It
-   settled README open points 1–3 and 5; 4 and 6 are with the flagship team.
-   Not done from that review: checking `mcp`'s dependencies against the hive's
-   pins, and the live demo.
+   First review (Dot for Jon, on 8051f30) handled on branch `review-1` as
+   0.2.0 (13 Nov 2026): reads reviewed by a person, definition digests,
+   device code only in the connect result, locked token renewal, new session
+   on a new token, `mcp>=1.30,<3`. It settled README open points 1–3 and 5;
+   4 and 6 are with the flagship team. Not done from that review: checking
+   `mcp`'s dependencies against the hive's pins, and the live demo.
 2. Microsoft 365 showcase on a dev tenant (Microsoft 365 Developer Program):
    Entra app registration (public client, device code enabled), delegated
    scopes for reading a Teams channel, then one write (post a message) behind
