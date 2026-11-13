@@ -502,6 +502,32 @@ def test_empty_view(hive):
     assert graph["items"] == [] and "No servers yet" in graph["notes"][0]
 
 
+def test_the_view_stays_within_the_hosts_400_items(hive, wide_demo):
+    """Two servers with 260 tools each would make over 500 items, and the host refuses a view past
+    400. Each server gets an even share of the room, the view says what it left out, and list-tools
+    still lists every tool."""
+    counts = {}
+    for name in ("left", "right"):
+        add(hive, "s1", name, wide_demo)
+        counts[name] = len(mind(hive, "s1", "list-tools", f"k-{name}", server=name)["detail"]["tools"][name])
+    assert counts["left"] == counts["right"] > 250
+    graph = run(hive.view("s1", PERSON))
+    assert len(graph["items"]) <= 400
+    shown = {name: sum(1 for i in graph["items"] if i["id"].startswith(f"tool:{name}/")) for name in counts}
+    assert abs(shown["left"] - shown["right"]) <= 1 and sum(shown.values()) >= 400 - 2 - 2
+    assert f"Tools shown: {shown['left']} of {counts['left']}" in text_of(graph, "server:left")
+    assert "list-tools lists them all" in graph["notes"][0]
+
+
+def test_an_address_with_a_port_that_is_not_a_number(hive):
+    """It is refused when added; one kept by an earlier version no longer breaks the view."""
+    refused = add(hive, "s1", "x", "https://example.com:abc/mcp")
+    assert refused["status"] == "refused" and "port" in refused["message"]
+    hive.program.store_mod.SwarmStore("s1").put_server(
+        {"name": "old", "transport": "http", "url": "https://example.com:abc/mcp", "auth": {"kind": "none"}})
+    assert "Address: (not a valid address)" in text_of(run(hive.view("s1", PERSON)), "server:old")
+
+
 # ------------------------------------------------------------------ Microsoft 365 style sign-in
 
 def test_device_code_sign_in_and_revoke(hive, guarded_url, fake_authority, tmp_path, monkeypatch):
