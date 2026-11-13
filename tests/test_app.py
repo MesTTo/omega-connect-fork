@@ -7,6 +7,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -73,6 +74,10 @@ def assert_no_secrets(outputs, tmp_path, caplog, *secrets):
             blob += path.read_text("utf-8", errors="ignore")
     for secret in secrets:
         assert secret not in blob
+
+
+def origin(url):
+    return f"{urlsplit(url).scheme}://{urlsplit(url).netloc}"
 
 
 @pytest.fixture
@@ -216,6 +221,7 @@ def test_a_write_delivered_again_after_a_failure_warns_it_may_repeat(hive, demo_
 def test_tokens_never_appear_in_results_views_traces_or_logs(hive, guarded_url, caplog, monkeypatch, tmp_path):
     caplog.set_level(logging.DEBUG)
     monkeypatch.setenv("OMEGA_CONNECT_CRED_DEMO", SECRET)
+    monkeypatch.setenv("OMEGA_CONNECT_ORIGINS_DEMO", origin(guarded_url))
     signin = {"kind": "bearer-env", "variable": "OMEGA_CONNECT_CRED_DEMO"}
     assert add(hive, "s1", "guarded", guarded_url, signin=signin)["status"] == "done"
     outputs = [
@@ -432,6 +438,26 @@ def test_stdio_is_off_by_default(hive, monkeypatch):
 def test_bearer_env_only_reads_app_variables(hive, demo_url):
     bad = add(hive, "s1", "x", demo_url, signin={"kind": "bearer-env", "variable": "OPENAI_API_KEY"})
     assert bad["status"] == "refused"
+
+
+def test_an_operator_token_goes_only_to_the_addresses_the_operator_lists(hive, guarded_url, demo_url, monkeypatch):
+    """A person adding a server chooses its address; the operator's token goes only where the operator
+    said, checked when the server is added and again before every call."""
+    monkeypatch.setenv("OMEGA_CONNECT_CRED_DEMO", SECRET)
+    signin = {"kind": "bearer-env", "variable": "OMEGA_CONNECT_CRED_DEMO"}
+    unlisted = add(hive, "s1", "guarded", guarded_url, signin=signin)
+    assert unlisted["status"] == "refused" and "OMEGA_CONNECT_ORIGINS_DEMO" in unlisted["message"]
+    monkeypatch.setenv("OMEGA_CONNECT_ORIGINS_DEMO", f"https://api.example.com, {origin(guarded_url)}")
+    elsewhere = add(hive, "s1", "elsewhere", demo_url, signin=signin)  # same host, another port
+    assert elsewhere["status"] == "refused" and origin(demo_url) in elsewhere["message"]
+    assert add(hive, "s1", "guarded", guarded_url, signin=signin)["status"] == "done"
+    review(hive, "s1", "guarded")
+    sent = mind(hive, "s1", "read-tool", "k1", server="guarded", tool="add", arguments={"a": 1, "b": 1})
+    assert sent["detail"]["result"]["text"] == "2"  # the token reached the listed server
+    monkeypatch.setenv("OMEGA_CONNECT_ORIGINS_DEMO", "https://api.example.com")  # the operator narrows the list
+    hive.program.ENGINE.forget("s1", "guarded")
+    later = mind(hive, "s1", "read-tool", "k2", server="guarded", tool="add", arguments={"a": 1, "b": 1})
+    assert later["status"] == "error" and "OMEGA_CONNECT_ORIGINS_DEMO" in later["message"]
 
 
 def test_url_rules(hive):

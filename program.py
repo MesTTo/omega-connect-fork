@@ -18,8 +18,9 @@ What the app guarantees on its side
   refuses anything else. Until a person looks, every tool of a new server is
   write.
 - Credentials stay inside the app: environment-provided bearer tokens are
-  read at call time; OAuth tokens are encrypted at rest. Neither appears in
-  results, views, traces, logs or errors.
+  read at call time and go only to the addresses the operator lists for them;
+  OAuth tokens are encrypted at rest. Neither appears in results, views,
+  traces, logs or errors.
 - Tool output is returned as data, capped in size, and labelled untrusted.
 - Every call is traced with server, tool, digests of arguments and result,
   status, actor and the hive's record id for the act.
@@ -209,6 +210,9 @@ async def _auth_headers(swarm: str, store, record: dict) -> dict[str, str]:
     if kind == "none":
         return {}
     if kind == "bearer-env":
+        why = _token_may_not_go(auth["variable"], record.get("url"))
+        if why:
+            raise engine_mod.EngineError("credentials", why)
         value = os.environ.get(auth["variable"], "")
         if not value:
             raise engine_mod.EngineError(
@@ -224,6 +228,43 @@ async def _auth_headers(swarm: str, store, record: dict) -> dict[str, str]:
             token = await asyncio.to_thread(_renew_token, swarm, store, record)
         return {"Authorization": f"Bearer {token['access_token']}"}
     raise engine_mod.EngineError("config", f"unknown auth kind '{kind}'")
+
+
+def _origin(url: str) -> str | None:
+    """scheme://host[:port] of an address, lowercase, without the scheme's default port; None when
+    it has no scheme or host, or a port that is not a number."""
+    parts = urlsplit(url.strip())
+    scheme, host = parts.scheme.lower(), (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if not scheme or not host:
+        return None
+    host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{host}" if port is None or (scheme, port) in (("https", 443), ("http", 80)) \
+        else f"{scheme}://{host}:{port}"
+
+
+def _origins_variable(variable: str) -> str:
+    """Where the operator lists the addresses a bearer-env token may go:
+    OMEGA_CONNECT_CRED_GITHUB -> OMEGA_CONNECT_ORIGINS_GITHUB, space- or comma-separated."""
+    return "OMEGA_CONNECT_ORIGINS_" + variable[len("OMEGA_CONNECT_CRED_"):]
+
+
+def _token_may_not_go(variable: str, url: str | None) -> str | None:
+    """Why the operator's token in `variable` may not go to `url`, or None when its origin is one the
+    operator listed. A person adding a server chooses the address, so without this list they could
+    send the operator's token to a server of their own."""
+    entries = os.environ.get(_origins_variable(variable), "").replace(",", " ").split()
+    listed = {origin for origin in map(_origin, entries) if origin}
+    target = _origin(url) if url else None
+    if target is None:
+        return f"{variable} is sent only to an HTTP server with a well-formed address"
+    if target not in listed:
+        return (f"the operator has not listed {target} for {variable}; "
+                f"they list where it may go in {_origins_variable(variable)}")
+    return None
 
 
 def _renew_token(swarm: str, store, record: dict) -> dict:
@@ -687,6 +728,9 @@ def _add_server(ctx, swarm, store, items, params):
         if not store_mod.CRED_VARIABLE.match(variable):
             return _refused("bearer-env reads only variables named OMEGA_CONNECT_CRED_<NAME>, "
                             "so a server can never be pointed at the hive's own secrets")
+        why = _token_may_not_go(variable, record.get("url"))
+        if why:
+            return _refused(why)
         record["auth"] = {"kind": kind, "variable": variable}
     elif kind == "oauth-device":
         tenant = str(auth.get("tenant", "organizations"))
