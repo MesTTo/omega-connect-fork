@@ -261,8 +261,10 @@ def drive(procs: Processes, args, steps: Steps, answers: pathlib.Path | None) ->
     again = s.mind(dot, "use-tool", "demo-post", waiting["approval_id"], **body)
     steps.check("the identical retry returns the recorded result and posts nothing more", again == posted)
     write = next((t for t in procs.traces() if t.get("action") == "use-tool" and t.get("status") == "done"), {})
-    steps.check("the trace records the post and who approved it",
-                write.get("tool") == "post_channel_message" and bool(write.get("approved_by")), write)
+    # The record id ties the post to the hive's own record of the act, which names the approver; the app's trace
+    # names the approver itself too once it records ctx.actor.approval (N0g4D/omega-connect#5).
+    steps.check("the trace records the post", write.get("tool") == "post_channel_message" and
+                bool(write.get("record_id")), {"record_id": write.get("record_id"), "approved_by": write.get("approved_by")})
 
 
 def main() -> None:
