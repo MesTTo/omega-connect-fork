@@ -483,7 +483,8 @@ def _signin_text(swarm: str, store, name: str, record: dict) -> str:
             state += f"; lent to minds by {minds}" + (f", as {account}" if account else "")
         else:
             state += "; none lent to minds"
-    started = sorted(by for (s, n, by) in list(_PENDING_SIGNINS) if (s, n) == (swarm, name))
+    with _SIGNIN_LOCK:  # sign-in threads add and drop entries
+        started = sorted(by for (s, n, by) in _PENDING_SIGNINS if (s, n) == (swarm, name))
     if started:
         state += f"; a sign-in started by {', '.join(started)} is in progress"
     return f"Sign-in: oauth-device ({state})"
