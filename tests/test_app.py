@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -642,6 +643,36 @@ def test_an_address_with_a_port_that_is_not_a_number(hive):
     hive.program.store_mod.SwarmStore("s1").put_server(
         {"name": "old", "transport": "http", "url": "https://example.com:abc/mcp", "auth": {"kind": "none"}})
     assert "Address: (not a valid address)" in text_of(run(hive.view("s1", PERSON)), "server:old")
+
+
+def test_state_files_and_traces_reach_the_disk(hive, demo_url, monkeypatch):
+    """A state file is flushed before it replaces the old one, then its folder, so a crash leaves the
+    old file or the new one; a trace line is flushed as it is written."""
+    synced, fsync = [], os.fsync
+
+    def recorded(fd):
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recorded)
+    add(hive, "s1", "demo", demo_url)
+    store = hive.program.store_mod.SwarmStore("s1")
+    assert str(store.dir / "servers.json.tmp") in synced and str(store.dir) in synced
+    synced.clear()
+    store.trace({"action": "test"})
+    assert str(store.dir / "trace.jsonl") in synced
+
+
+def test_the_trace_stays_bounded_and_every_line_moves_the_revision(hive, monkeypatch):
+    monkeypatch.setattr(hive.program.store_mod, "TRACE_MAX_BYTES", 4000)
+    store = hive.program.store_mod.SwarmStore("s1")
+    revisions = set()
+    for n in range(200):
+        store.trace({"action": "test", "n": n})
+        revisions.add(run(hive.view("s1", PERSON))["revision"])
+    assert (store.dir / "trace.jsonl").stat().st_size <= 4000
+    assert [entry["n"] for entry in store.traces(3)] == [197, 198, 199]
+    assert len(revisions) == 200  # trims included
 
 
 # ------------------------------------------------------------------ Microsoft 365 style sign-in
