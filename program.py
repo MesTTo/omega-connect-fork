@@ -695,6 +695,7 @@ async def _call_tool(ctx, swarm, store, action, items, params):
     intent = _intent_key(ctx, params) if action == "use-tool" else None
     earlier = None
     if intent:
+        store_mod._fernet(store_mod.INTENTS)  # fail now, before anything goes out, if they cannot be kept
         earlier = store.intent(intent)
         if earlier is not None:
             if earlier["request"] != request_digest:

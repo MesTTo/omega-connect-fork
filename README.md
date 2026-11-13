@@ -101,7 +101,7 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
 - **Every call is traced**: server, tool, digest of the arguments, digest of
   the result, status, actor, who approved it and the approval's id
   (`ctx.actor.approval`), and the hive's record id for the act
-  (`ctx.command.record_id`). Content is never stored.
+  (`ctx.command.record_id`). Traces never hold content.
 - **Streamable HTTP by default.** `https://` only (plain `http` for localhost),
   no credentials in URLs. stdio servers start processes on the hive's machine
   and are refused unless the operator sets `OMEGA_CONNECT_ALLOW_STDIO=1`.
@@ -119,14 +119,18 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
   the hive recorded as done comes back as a recovery (`ctx.actor.recovery`,
   with the approval it first ran under): `use-tool` answers from its own
   record, and if that record is gone it refuses (`detail.type: "recovery"`)
-  instead of running the tool a second time.
+  instead of running the tool a second time. Those records keep each answer
+  whole, what the tool sent back included, so they are encrypted with the
+  tokens' key (`intents.bin`), never kept in clear, and cut to the newest half
+  once they pass 1 MiB, as the trace is. Without the key a mind's `use-tool`
+  fails before anything goes out.
 
 ## Mount it in a hive
 
 ```sh
 pip install -r requirements.txt              # into the hive's Python environment
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-export OMEGA_CONNECT_SECRET_KEY=<that key>    # needed only for OAuth sign-in
+export OMEGA_CONNECT_SECRET_KEY=<that key>    # for OAuth sign-in and minds' use-tool
 export HIVE_PLUGIN_DIRS=/path/to/omega-connect
 ```
 
@@ -231,12 +235,16 @@ Behaviour that changes for a hive that ran 0.1.0:
 - **Requirements:** `mcp>=1.30,<3` (was `mcp>=1.10`). 1.30 is the lowest
   version the tests have run with; 1.10 does not even import with pydantic
   2.12 or later.
+- **`use-tool`'s records are encrypted:** `intents.json` becomes
+  `intents.bin`, encrypted with `OMEGA_CONNECT_SECRET_KEY`, which a mind's
+  `use-tool` now needs as OAuth sign-in does. A plain `intents.json` left by
+  0.1.0 is moved into it and deleted the first time `use-tool` runs.
 
 ## Tests
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 61 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 64 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
@@ -330,7 +338,7 @@ Grove, on 8051f30) answered each of them.
 |---|---|
 | `plugin.json`, `program.py` | App identity and the host program (`describe` / `view` / `act`) |
 | `connect/engine.py` | MCP sessions: one long-lived task per server on a private event loop; tool lists and their definition digests |
-| `connect/store.py` | Per-swarm servers (with the reads a person accepted), encrypted credentials, traces, intents |
+| `connect/store.py` | Per-swarm servers (with the reads a person accepted), encrypted credentials and `use-tool` records, traces |
 | `connect/oauth.py` | OAuth 2.0 device authorization grant (standard library only) |
 | `tests/` | Fake host, mock MCP server, fake identity provider, tests |
 | `examples/teams-mcp/` | Microsoft Teams MCP server over Graph for the live demo (127.0.0.1 only), its tests, the demo steps and `demo.py`, which runs them on a real tenant |

@@ -710,6 +710,51 @@ def test_the_trace_stays_bounded_and_every_line_moves_the_revision(hive, monkeyp
     assert len(revisions) == 200  # trims included
 
 
+def test_use_tool_records_are_encrypted_and_a_plain_file_is_moved_in(hive, demo_url, tmp_path):
+    """use-tool keeps the answer to each request for its retries, what the tool sent back included, so the
+    records are encrypted with the tokens' key and no tool result stays on disk in clear. A plain
+    intents.json from an earlier version is moved into them and deleted."""
+    add(hive, "s1", "demo", demo_url)
+    review(hive, "s1", "demo")
+    store = hive.program.store_mod.SwarmStore("s1")
+    (store.dir / "intents.json").write_text(json.dumps(
+        {"old": {"request": "sha256:0", "result": {"status": "done", "message": "legacy-9c1d"}, "at": 1.0}}))
+    note = {"server": "demo", "tool": "create_note", "arguments": {"title": "marker-7f3a", "text": "x"}}
+    done = write(hive, "s1", "w1", **note)
+    assert done["detail"]["result"]["text"] == "saved 'marker-7f3a'"
+    stored = b"".join(p.read_bytes() for p in Path(tmp_path, "store").rglob("*") if p.is_file())
+    assert b"marker-7f3a" not in stored and b"legacy-9c1d" not in stored
+    assert not (store.dir / "intents.json").exists() and (store.dir / "intents.bin").exists()
+    assert store.intent("w1")["result"] == done and store.intent("old")["result"]["message"] == "legacy-9c1d"
+    assert mind(hive, "s1", "use-tool", "w1", **note) == done  # a retry still gets its answer
+
+
+def test_without_the_key_a_minds_write_sends_nothing(hive, demo_url, monkeypatch):
+    """A mind's use-tool cannot keep its records without OMEGA_CONNECT_SECRET_KEY, so it fails before the
+    call goes out."""
+    add(hive, "s1", "demo", demo_url)
+    review(hive, "s1", "demo")
+    note = {"server": "demo", "tool": "create_note", "arguments": {"title": "x", "text": "y"}}
+    approval_id = person_approves(hive, "s1", "w1", **note)
+    monkeypatch.delenv("OMEGA_CONNECT_SECRET_KEY")
+    failed = mind(hive, "s1", "use-tool", "w1", approval_id, **note)
+    assert failed["status"] == "error" and "OMEGA_CONNECT_SECRET_KEY" in failed["message"]
+    assert "use-tool's records" in failed["message"]
+    assert mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"] \
+        == "(no notes)"
+
+
+def test_use_tool_records_stay_bounded(hive, monkeypatch):
+    """Like the trace, the records are cut to the newest half once they pass their limit."""
+    monkeypatch.setattr(hive.program.store_mod, "INTENTS_MAX_BYTES", 4000)
+    store = hive.program.store_mod.SwarmStore("s1")
+    for n in range(100):
+        store.put_intent(f"k{n}", {"request": "sha256:0", "result": {"text": "x" * 100}, "at": n})
+    kept = store._intents()
+    assert len(json.dumps(kept)) <= 4000 and 10 <= len(kept) < 100
+    assert sorted(kept, key=lambda k: kept[k]["at"]) == [f"k{n}" for n in range(100 - len(kept), 100)]
+
+
 # ------------------------------------------------------------------ Microsoft 365 style sign-in
 
 def test_device_code_sign_in_and_revoke(hive, guarded_url, fake_authority, tmp_path, monkeypatch):

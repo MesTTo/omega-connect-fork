@@ -62,7 +62,9 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
 - `connect/store.py`: per-swarm folder under `OMEGA_CONNECT_DATA_DIR`:
   servers.json (no secrets; the tools a person accepted as read, with the
   digest of each definition), secrets.bin (Fernet), trace.jsonl (digests),
-  intents.json (app-level idempotency for use-tool). Files mode 0600.
+  intents.bin (app-level idempotency for use-tool, each answer included:
+  Fernet, newest half kept past 1 MiB; a plain intents.json is moved in).
+  Files mode 0600.
 - `connect/oauth.py`: RFC 8628 device flow, and authorization code with PKCE
   (RFC 7636) finished by the address the browser lands on, for tenants that
   block the device code; standard library only; authority
@@ -90,7 +92,7 @@ can finish it.
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests            # 61 tests, ~65 s, localhost only
+python -m pytest -q tests            # 64 tests, ~70 s, localhost only
 python -m pytest -q examples/teams-mcp   # 32 tests, ~17 s, Graph simulated in memory
 ```
 
@@ -104,7 +106,8 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
 
 - Never put a credential in a result, view, trace, log line or error. New
   outputs that can carry server text go through `_scrub` / `engine.redact`.
-- Never store tool content; traces hold digests only.
+- Never store tool content in clear: traces hold digests only, and
+  use-tool's records (its answers, for retries) are encrypted.
 - Keep `describe()` sync and cheap. Keep `view()` deterministic: no network,
   no connecting (the checker compares two views).
 - New behaviour needs a test in `tests/test_app.py` through `FakeHive`.
