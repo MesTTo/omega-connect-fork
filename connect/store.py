@@ -230,3 +230,10 @@ class SwarmStore:
                 for old in sorted(data, key=lambda k: data[k].get("at", ""))[: len(data) - TRACE_KEEP]:
                     data.pop(old, None)
             _write_private(path, json.dumps(data, sort_keys=True).encode())
+
+    def drop_intent(self, key: str) -> None:
+        with self.lock:
+            path = self.dir / "intents.json"
+            data = json.loads(path.read_text("utf-8")) if path.exists() else {}
+            if data.pop(key, None) is not None:
+                _write_private(path, json.dumps(data, sort_keys=True).encode())

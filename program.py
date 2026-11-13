@@ -151,8 +151,10 @@ def _actor(ctx) -> str:
 
 def _command(ctx, name: str) -> Any:
     """A field of ctx.command, the request identity the hive sets for act():
-    idempotency_key, record_id, and prior_failed when it delivers again an
-    attempt that failed (PROGRAMS.md 9d). It does not say who approved."""
+    idempotency_key and record_id. The person route also sets prior_failed when
+    it delivers again an attempt that failed (PROGRAMS.md 9d); the agent route
+    delivers a mind's failed attempt again with the same record_id and no
+    prior_failed."""
     command = getattr(ctx, "command", None)
     return command.get(name) if isinstance(command, dict) else getattr(command, name, None)
 
@@ -565,8 +567,8 @@ async def _inspect_tool(swarm, store, items, params):
 
 
 # The hive delivers an intent again after an attempt that failed with an unknown
-# effect (PROGRAMS.md 9d). If this app kept no record of that attempt, it may
-# still have reached the server, so the new result says so.
+# effect (PROGRAMS.md 9d). If that attempt went out and no result was kept, it may
+# have reached the server, so the new result says so.
 _PRIOR_FAILED = "An earlier attempt at this request failed with an unknown outcome and may already have taken effect."
 
 
@@ -579,24 +581,38 @@ async def _call_tool(ctx, swarm, store, action, items, params):
     request_digest = store_mod.digest({"action": action, "server": record["name"], "tool": tool,
                                        "arguments": arguments})
     intent = _intent_key(ctx, params) if action == "use-tool" else None
+    earlier = None
     if intent:
-        seen = store.intent(intent)
-        if seen is not None:
-            if seen["request"] != request_digest:
+        earlier = store.intent(intent)
+        if earlier is not None:
+            if earlier["request"] != request_digest:
                 return _refused("this idempotency key was used for a different request", detail={"type": "conflict"})
-            return seen["result"]
-    result, attempted = await _run_tool(ctx, swarm, store, action, record, tool, arguments)
-    if action == "use-tool" and _command(ctx, "prior_failed"):
+            if earlier.get("result") is not None:
+                return earlier["result"]
+    # An attempt that went out and kept no result left only this record, written just before the
+    # call (below). The agent route sends no prior_failed, so the record is how a mind's write
+    # delivered again is known.
+    unknown = bool(earlier) or bool(_command(ctx, "prior_failed"))
+
+    def sending():
+        if intent:
+            store.put_intent(intent, {"request": request_digest, "result": None, "at": time.time()})
+
+    result, attempted = await _run_tool(ctx, swarm, store, action, record, tool, arguments, sending)
+    if action == "use-tool" and unknown:
         result = {**result, "message": f"{_PRIOR_FAILED} {result['message']}".strip(),
                   "detail": {**(result.get("detail") or {}), "prior_failed": True}}
     if intent and attempted:
         store.put_intent(intent, {"request": request_digest, "result": result, "at": time.time()})
+    elif intent and not earlier:
+        store.drop_intent(intent)  # nothing went out this time, and nothing earlier is unknown
     return result
 
 
-async def _run_tool(ctx, swarm, store, action, record, tool, arguments):
+async def _run_tool(ctx, swarm, store, action, record, tool, arguments, sending=lambda: None):
     """Connect, check the tool's class, call it and trace. Returns (result, attempted):
-    attempted is False when the call never went out, so a retry may still run it."""
+    attempted is False when the call never went out, so a retry may still run it.
+    sending() runs just before each call goes out."""
     secrets = _secrets_for(store, record)
     trace = {"action": action, "server": record["name"], "tool": tool, "actor": _actor(ctx),
              "record_id": _command(ctx, "record_id"), "arguments_digest": store_mod.digest(arguments)}
@@ -619,6 +635,7 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments):
             store.trace({**trace, "status": "refused", "reason": "write-classed"})
             return _refused(_write_reason(tool, review),
                             detail={"class": cls, **({"review": review} if review else {})}), False
+        sending()
         try:
             outcome = await ENGINE.call(swarm, spec, tool, arguments, retry_on_drop=(cls == READ), expect=info.digest)
             break

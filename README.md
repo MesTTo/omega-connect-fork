@@ -105,10 +105,13 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
 - **Idempotency twice.** The hive records intents; the app also keeps its own
   record for `use-tool`, so a retried write returns its recorded result. The
   hive promises at most one delivery per confirm, not exactly-once effects
-  (PROGRAMS.md 9d): when it delivers again an attempt that failed with an
-  unknown effect (`ctx.command.prior_failed`) and the app has no record of it,
-  `use-tool` runs the tool again and the result says the first attempt may
-  already have taken effect (`detail.prior_failed: true`).
+  (PROGRAMS.md 9d). Just before a `use-tool` call goes out, the app records
+  it without a result. When the hive delivers again an attempt that failed
+  with an unknown effect and that record has no result yet, `use-tool` runs
+  the tool again and the result says the first attempt may already have taken
+  effect (`detail.prior_failed: true`). The app needs its own record for this:
+  the hive's agent route delivers a mind's failed attempt again with the same
+  `record_id` and no `ctx.command.prior_failed`.
 
 ## Mount it in a hive
 
@@ -207,7 +210,7 @@ Behaviour that changes for a hive that ran 0.1.0:
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 47 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 48 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
@@ -281,11 +284,11 @@ Grove, on 8051f30) answered each of them.
    token belongs to whoever signs in, but the copy does not define it further.
 5. **Agreed, as a separate small piece:** the mind skill for native Omega
    minds (brief, "a second, smaller piece").
-6. **With the flagship team: failed writes delivered again after "ask".**
-   Section 9d describes `prior_failed` for acts a person confirms in the host.
-   `use-tool` reaches the app through a mind's "ask" approval; the app and
-   `tests/fakehive.py` assume the same rules there (a failed attempt runs again
-   only after a new approval, with the same `record_id` and `prior_failed`).
+6. **Settled: failed writes delivered again after "ask".** Section 9d
+   describes `prior_failed` for acts a person confirms in the host. For a
+   mind, `hive/core/program_actions.py` (`agent_act`) delivers a failed
+   attempt again only after a new approval, with the same `record_id` and no
+   `prior_failed`, so the app keeps its own record of each call that went out.
 
 ## Layout
 

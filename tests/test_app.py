@@ -185,15 +185,18 @@ def test_app_level_idempotency_also_holds(program, demo_url):
 
 def test_a_write_delivered_again_after_a_failure_warns_it_may_repeat(hive, demo_url, monkeypatch):
     """PROGRAMS.md 9d: an attempt that failed has an unknown effect. The hive delivers it again only
-    after a new approval, with ctx.command.prior_failed; the app, holding no record of the first
-    attempt, runs the tool and says the first attempt may already have taken effect."""
+    after a new approval. The app finds the record it wrote just before the first attempt went out,
+    with no result kept, so it runs the tool and says the first attempt may already have taken
+    effect. It needs no ctx.command.prior_failed, which the agent route does not send."""
     add(hive, "s1", "demo", demo_url)
     review(hive, "s1", "demo")
     args = {"title": "plan", "text": "x"}
     store_cls = hive.program.store_mod.SwarmStore
     put_intent = store_cls.put_intent
 
-    def lose_the_record(self, key, record):  # the tool ran, then the app failed before keeping its record
+    def lose_the_record(self, key, record):  # the tool ran, then the app failed before keeping its result
+        if record["result"] is None:
+            return put_intent(self, key, record)  # the record written just before the call goes out
         monkeypatch.setattr(store_cls, "put_intent", put_intent)
         raise OSError("disk full")
 
@@ -211,6 +214,28 @@ def test_a_write_delivered_again_after_a_failure_warns_it_may_repeat(hive, demo_
     assert done["status"] == "done" and done["detail"]["prior_failed"] is True
     assert "may already have taken effect" in done["message"]
     assert done["detail"]["result"]["text"] == "saved 'plan'"
+
+
+def test_a_write_that_never_went_out_is_not_reported_as_unknown(program, demo_url, monkeypatch):
+    """A call the engine never sends (its tool changed twice while being checked) leaves no record,
+    so the next delivery runs it with no warning."""
+    from fakehive import Ctx
+
+    hive = FakeHive(program)
+    add(hive, "s1", "demo", demo_url)
+    ctx = Ctx(swarm_id="s1", actor={"kind": "mind", "id": MIND}, command={"idempotency_key": "w1"})
+    params = {"server": "demo", "tool": "create_note", "arguments": {"title": "a", "text": "b"}}
+    call = program.ENGINE.call
+
+    async def changed(*args, **kwargs):
+        raise program.engine_mod.EngineError("tool_changed", "'create_note' changed before this call went out")
+
+    monkeypatch.setattr(program.ENGINE, "call", changed)
+    assert run(program.act(ctx, "use-tool", [], params))["status"] == "error"
+    assert program.store_mod.SwarmStore("s1").intent("w1") is None
+    monkeypatch.setattr(program.ENGINE, "call", call)
+    done = run(program.act(ctx, "use-tool", [], params))
+    assert done["status"] == "done" and "prior_failed" not in done["detail"]
 
 
 def test_tokens_never_appear_in_results_views_traces_or_logs(hive, guarded_url, caplog, monkeypatch, tmp_path):
