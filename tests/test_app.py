@@ -114,6 +114,7 @@ def test_describe_matches_the_brief(program):
     for name in ("list-servers", "list-tools", "read-tool"):
         assert actions[name]["agents"] is True and actions[name]["effect"] == "read"
     assert actions["use-tool"]["agents"] is True and actions["use-tool"].get("effect") != "read"
+    assert actions["use-tool"]["approver"] == "person"  # a named person, never the local operator password
     for name in ("add-server", "remove-server", "accept-reads", "connect", "revoke", "reclass-tool"):
         assert not actions[name].get("agents") and actions[name]["confirm"] is True
     assert actions["accept-reads"]["applies_to"] == ["server", "tool"]
@@ -858,6 +859,23 @@ def test_minds_use_only_a_sign_in_lent_to_them(hive, guarded_url, fake_authority
     assert isinstance(mind(hive, "s1", "list-tools", "k3", server="m365")["detail"]["tools"]["m365"], list)
     odd = run(hive.person_act("s1", PERSON, "connect", ["server:m365"], {"for_minds": "yes"}, confirmed=True))
     assert odd["status"] == "refused"
+
+
+def test_a_minds_write_on_a_lent_sign_in_needs_the_lenders_approval(hive, guarded_url, fake_authority):
+    """A mind's write on a lent sign-in runs as the lender's account, so nobody else can approve it as
+    them: the approver the hive names must be the lender."""
+    fake_authority.pending_polls = 0
+    add(hive, "s1", "m365", guarded_url, signin=SIGNIN)
+    sign_in(hive, "s1", "m365")  # ada lends hers
+    call = {"server": "m365", "tool": "add", "arguments": {"a": 1, "b": 2}}
+    asked = mind(hive, "s1", "use-tool", "w1", **call)
+    hive.approve(asked["approval_id"], "bob")
+    refused = mind(hive, "s1", "use-tool", "w1", asked["approval_id"], **call)
+    assert refused["status"] == "refused"
+    assert refused["detail"] == {"type": "lender_approval_needed", "lender": f"user:{PERSON}"}
+    traced = hive.program.store_mod.SwarmStore("s1").traces(1)[0]
+    assert (traced["reason"], traced["approved_by"]) == ("approver-not-lender", "user:bob")
+    assert write(hive, "s1", "w2", **call)["detail"]["result"]["text"] == "3"  # ada approves her own
 
 
 def test_sign_in_needs_an_encryption_key(hive, guarded_url, fake_authority, monkeypatch):

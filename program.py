@@ -96,8 +96,9 @@ USE_TOOL_EFFECT: str | None = None
 
 def describe():
     agent_read = {"agents": True, "effect": "read"}
+    # approver "person": a named person approves, never the local operator password (PROGRAMS.md 9d).
     use_tool = {"id": "use-tool", "label": "Use a tool (may change data)", "applies_to": ["tool"],
-                "agents": True, "binding_params": ["server", "tool", "arguments"]}
+                "agents": True, "binding_params": ["server", "tool", "arguments"], "approver": "person"}
     if USE_TOOL_EFFECT:
         use_tool["effect"] = USE_TOOL_EFFECT
     return {
@@ -436,8 +437,8 @@ def _server_status(swarm: str, record: dict) -> dict:
     return out
 
 
-async def _connected(ctx, store, swarm: str, record: dict):
-    spec = await _spec(swarm, store, record, _signin_owner(ctx, store, record))
+async def _connected(store, swarm: str, record: dict, owner: str | None):
+    spec = await _spec(swarm, store, record, owner)
     return await ENGINE.connect(swarm, spec), spec
 
 
@@ -699,7 +700,7 @@ async def _list_tools(ctx, swarm, store, items, params):
             out[name] = {"error": "no such server"}
             continue
         try:
-            worker, _ = await _connected(ctx, store, swarm, record)
+            worker, _ = await _connected(store, swarm, record, _signin_owner(ctx, store, record))
             out[name] = [_tool_entry(record, t) for t in sorted(worker.tools.values(), key=lambda t: t.name)
                          if _classify(record, t) != HIDDEN]
         except Exception as exc:
@@ -709,7 +710,7 @@ async def _list_tools(ctx, swarm, store, items, params):
 
 async def _inspect_tool(ctx, swarm, store, items, params):
     record, tool = _target(store, items, params, need_tool=True)
-    worker, _ = await _connected(ctx, store, swarm, record)
+    worker, _ = await _connected(store, swarm, record, _signin_owner(ctx, store, record))
     info = worker.tools.get(tool)
     if info is None or _classify(record, info) == HIDDEN:
         return _refused(f"server '{record['name']}' has no available tool '{tool}'")
@@ -785,12 +786,22 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments, sending=
         return _refused("a person approves every use-tool call a mind makes: the owner keeps use-tool on "
                         "\"ask\" for minds, and the mind sends the request again with the approval; reads go "
                         "through read-tool", detail={"type": "approval_needed"}), False
+    try:
+        owner = _signin_owner(ctx, store, record)  # one owner for the whole call, retries included
+    except engine_mod.EngineError as exc:
+        store.trace({**trace, "status": "error", "reason": exc.message[:200]})
+        return _result("error", exc.message, detail={"type": exc.kind}), False
+    if action == "use-tool" and _actor_kind(ctx) == "mind" and owner and approval.get("approved_by") != owner:
+        # A mind's write on a lent sign-in runs as the lender's account, so it is theirs to approve.
+        store.trace({**trace, "status": "refused", "reason": "approver-not-lender"})
+        return _refused(f"this write would run as the sign-in {owner} lent to the swarm's minds, so only {owner} "
+                        "can approve it", detail={"type": "lender_approval_needed", "lender": owner}), False
     # The class is checked against the definition the session holds, and the call goes out only
     # while it still holds that one. If the list is reloaded in between (tools/list_changed, a
     # reconnect), nothing is sent and the tool is classed once more by its new definition.
     for last_try in (False, True):
         try:
-            worker, spec = await _connected(ctx, store, swarm, record)
+            worker, spec = await _connected(store, swarm, record, owner)
         except Exception as exc:
             message = _error_text(exc, secrets)
             store.trace({**trace, "status": "error", "reason": message[:200]})

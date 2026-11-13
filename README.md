@@ -27,7 +27,7 @@ opens around 19–20 November.
 | `list-tools` | yes | read | Tools per server, each classed `read` or `write` |
 | `inspect-tool` | yes | read | One tool's description and full input schema |
 | `read-tool` | yes | read | Runs a tool only if it is classed `read` |
-| `use-tool` | yes | (write) | Runs any visible tool; a mind's call needs a person's approval ("ask") |
+| `use-tool` | yes | (write) | Runs any visible tool; a mind's call needs a person's approval ("ask"), and on a sign-in lent to minds the lender's |
 | `add-server`, `remove-server` | no | confirm | People only |
 | `accept-reads` | no | confirm | Accept the tools a server marks read-only as reads: a whole server, or one tool |
 | `reclass-tool` | no | confirm | Make a tool `write` or `hidden`, or back to `default` (never `read`) |
@@ -194,7 +194,11 @@ person lends it on purpose: `connect` with `{"for_minds": true}`, confirmed
 like any `connect`, lends the person's sign-in, or, if they have none yet, the
 one it starts. One sign-in per server is lent at a time; lending another
 replaces it. A mind's call uses the lent sign-in, and with none lent it is
-refused. The view says how many people signed in and whose sign-in is lent,
+refused. A mind's write on it runs as the lender's account, so only the
+lender can approve it: the approver the hive names (`approved_by`) must be
+the lender. `use-tool` also declares `approver: "person"` (PROGRAMS.md 9d),
+so that a named person approves, never the local operator password; whether
+the hive applies it to minds' approvals is to verify on a scratch hive. The view says how many people signed in and whose sign-in is lent,
 with its account (`preferred_username` from the id_token, kept only to show
 it; the id_token itself is not stored). `revoke` deletes only your own
 sign-in; if it was the lent one, minds have none until a person lends one
