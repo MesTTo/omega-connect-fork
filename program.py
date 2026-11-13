@@ -7,6 +7,8 @@ Who may do what
   through `read-tool`, and call any tool through `use-tool`. The hive gates
   each action with the rule program:omega-connect:<action>; the owner normally
   allows read-tool and keeps use-tool on "ask", so a person approves each write.
+  A mind's use-tool runs only with a person's approval: under an "allow" rule
+  the app refuses it.
 - Only people add or remove servers, accept a server's read-only tools
   (`accept-reads`), reclass tools, sign in (`connect`) and revoke a sign-in.
   Those actions need the host's confirm dialog.
@@ -165,6 +167,11 @@ def _approval(ctx) -> dict:
     actor = getattr(ctx, "actor", None)
     approval = actor.get("approval") if isinstance(actor, dict) else getattr(actor, "approval", None)
     return approval if isinstance(approval, dict) else {}
+
+
+def _actor_kind(ctx) -> str | None:
+    actor = getattr(ctx, "actor", None)
+    return actor.get("kind") if isinstance(actor, dict) else getattr(actor, "kind", None)
 
 
 def _intent_key(ctx, params: dict) -> str | None:
@@ -627,6 +634,14 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments, sending=
     trace = {"action": action, "server": record["name"], "tool": tool, "actor": _actor(ctx),
              "approved_by": approval.get("approved_by"), "approval_id": approval.get("id"),
              "record_id": _command(ctx, "record_id"), "arguments_digest": store_mod.digest(arguments)}
+    if action == "use-tool" and _actor_kind(ctx) == "mind" and not approval:
+        # The brief: every write is approved by a person. A mind's rule can still say "allow", for
+        # instance a pattern the owner wrote for its reads that also matches use-tool, so the app
+        # itself asks for the person.
+        store.trace({**trace, "status": "refused", "reason": "no-approval"})
+        return _refused("a person approves every use-tool call a mind makes: the owner keeps use-tool on "
+                        "\"ask\" for minds, and the mind sends the request again with the approval; reads go "
+                        "through read-tool", detail={"type": "approval_needed"}), False
     # The class is checked against the definition the session holds, and the call goes out only
     # while it still holds that one. If the list is reloaded in between (tools/list_changed, a
     # reconnect), nothing is sent and the tool is classed once more by its new definition.
