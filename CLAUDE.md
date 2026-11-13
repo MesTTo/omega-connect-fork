@@ -50,26 +50,38 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
 - `connect/engine.py`: MCP client. One private asyncio loop in a daemon
   thread; one long-lived task per (swarm, server) owns transport and
   ClientSession (anyio cancel scopes must stay in one task). Callers submit
-  work through a queue. Dropped connections reconnect on the next call; only
-  read-classed calls are retried. Supports MCP SDK 1.x and 2.x.
+  work through a queue. Dropped connections, and sessions the server forgot
+  (HTTP 404 after a restart), reconnect on the next call; only read-classed
+  calls are retried. Each session loads the tool list when it opens and on
+  `notifications/tools/list_changed` (the reload runs in the worker's task:
+  SDK 1.x calls the message handler inside its receive loop). Every tool keeps
+  a digest of its definition; `call(expect=digest)` sends nothing if the
+  definition changed. New auth headers mean a new session; the old one
+  finishes its calls (grace = call timeout). Supports MCP SDK 1.x and 2.x.
 - `connect/store.py`: per-swarm folder under `OMEGA_CONNECT_DATA_DIR`:
-  servers.json (no secrets), secrets.bin (Fernet), trace.jsonl (digests),
+  servers.json (no secrets; the tools a person accepted as read, with the
+  digest of each definition), secrets.bin (Fernet), trace.jsonl (digests),
   intents.json (app-level idempotency for use-tool). Files mode 0600.
 - `connect/oauth.py`: RFC 8628 device flow, standard library only; authority
-  overridable with `OMEGA_CONNECT_OAUTH_AUTHORITY` (tests use a fake).
+  overridable with `OMEGA_CONNECT_OAUTH_AUTHORITY` (tests use a fake). Keeps
+  only `preferred_username` from the id_token, to show who signed in.
+  Renewal runs in a thread under a lock per (swarm, server), in program.py.
 - `examples/teams-mcp/`: MCP server over Microsoft Graph for the Teams demo,
   separate from the app. 127.0.0.1 only; each call uses the token in its own
   request's Authorization header, never stored or logged. README = demo steps.
 
-Classification rule: read only if the server says `readOnlyHint` and the
-owner has not reclassed it; the owner can demote (write, hidden), never
-promote.
+Classification rule: read only if the server says `readOnlyHint`, a person
+accepted that tool with `accept-reads` (people only, confirm), and its
+definition digest still matches the accepted one; every tool of a new server
+is write until then. The owner can demote (write, hidden, back to default),
+never promote. The digest catches definition changes, not behaviour changes.
+The device code goes only into the `connect` result, never into `view()`.
 
 ## Commands
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests            # 35 tests, ~34 s, localhost only
+python -m pytest -q tests            # 47 tests, ~55 s, localhost only
 python -m pytest -q examples/teams-mcp   # 24 tests, ~2 s, Graph simulated in memory
 ```
 
@@ -93,7 +105,12 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
 
 1. Done (12 Nov 2026): `PROGRAMS.md` and `programs_check` came as a pre-release
    copy (`../omegahive-app-contract-04fc3f2`); the checker reports COMPATIBLE.
-   README open points 1 and 3 are settled; the others are still open.
+   First review (Dot for Jon, on 8051f30) handled on branch `review-1` (13 Nov
+   2026): reads reviewed by a person, definition digests, device code only in
+   the connect result, locked token renewal, new session on a new token. It
+   settled README open points 1–3 and 5; 4 and 6 are with the flagship team.
+   Not done from that review: checking `mcp`'s dependencies against the hive's
+   pins, and the live demo.
 2. Microsoft 365 showcase on a dev tenant (Microsoft 365 Developer Program):
    Entra app registration (public client, device code enabled), delegated
    scopes for reading a Teams channel, then one write (post a message) behind

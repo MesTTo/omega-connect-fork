@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import os
@@ -8,6 +9,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs
 
 import pytest
@@ -30,6 +32,13 @@ def program():
 
 
 @pytest.fixture(autouse=True)
+def fresh_sessions(program):
+    """Each test starts with no MCP sessions, as its store starts empty."""
+    yield
+    program.ENGINE.shutdown()
+
+
+@pytest.fixture(autouse=True)
 def isolated_store(tmp_path, monkeypatch):
     monkeypatch.setenv("OMEGA_CONNECT_DATA_DIR", str(tmp_path / "store"))
     monkeypatch.setenv("OMEGA_CONNECT_LOG_DIR", str(tmp_path / "logs"))
@@ -46,8 +55,8 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def _start_demo(env_extra: dict) -> tuple[subprocess.Popen, str]:
-    port = free_port()
+def _start_demo(env_extra: dict, port: int | None = None) -> tuple[subprocess.Popen, str]:
+    port = port or free_port()
     env = {**os.environ, **env_extra}
     proc = subprocess.Popen([sys.executable, str(DEMO), "http", str(port)], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -70,7 +79,27 @@ def demo_url():
     proc.wait(timeout=10)
 
 
+@pytest.fixture
+def restartable_demo():
+    """Demo server that a test can restart on the same address, with other settings."""
+    proc, url = _start_demo({})
+    demo = SimpleNamespace(url=url, proc=proc)
+
+    def restart(**env):
+        demo.proc.terminate()
+        demo.proc.wait(timeout=10)
+        demo.proc, _ = _start_demo(env, port=int(url.rsplit(":", 1)[1].split("/")[0]))
+
+    demo.restart = restart
+    yield demo
+    demo.proc.terminate()
+    demo.proc.wait(timeout=10)
+
+
 SECRET = "tok-9f2c4b7e51d0a8"
+NEW_TOKEN = "tok-3e8a1c6f92b47d"  # what a refresh returns when a test asks for a new token
+REFRESH = "rt-55aa66bb"  # the first refresh token; the ones that follow start with it too
+ACCOUNT = "ada@contoso.example"
 
 
 @pytest.fixture
@@ -82,31 +111,56 @@ def guarded_url():
     proc.wait(timeout=10)
 
 
+@pytest.fixture
+def token_server(tmp_path_factory):
+    """Demo server that answers only with the token `accept` last named (SECRET at first). The
+    file it reads sits outside the test's tmp_path, which tests search for leaked tokens."""
+    path = tmp_path_factory.mktemp("token-server") / "token"
+    path.write_text(SECRET)
+    proc, url = _start_demo({"DEMO_TOKEN_FILE": str(path)})
+    yield SimpleNamespace(url=url, accept=path.write_text)
+    proc.terminate()
+    proc.wait(timeout=10)
+
+
+def _id_token(claims: dict) -> str:
+    def part(value: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+    return f"{part({'alg': 'RS256', 'typ': 'JWT'})}.{part(claims)}.c2lnbmF0dXJl"
+
+
 class _FakeAuthority(BaseHTTPRequestHandler):
-    """Microsoft identity platform stand-in: device code then token."""
-    access_token = SECRET
-    pending_polls = 1
+    """Microsoft identity platform stand-in: device code, token, refresh. As with Entra, an id_token
+    comes when openid is asked for, and each refresh token works once: a refresh rotates it."""
+    state = None  # set by the fake_authority fixture
 
     def log_message(self, *args):
         pass
 
     def do_POST(self):
+        state = type(self).state
         length = int(self.headers.get("Content-Length", 0))
         form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode()).items()}
         if self.path.endswith("/devicecode"):
+            state.scopes.append(form.get("scope", ""))
             body = {"device_code": "dev-1", "user_code": "ABCD-1234",
                     "verification_uri": "https://microsoft.com/devicelogin",
                     "expires_in": 60, "interval": 1, "message": "sign in"}
         elif form.get("grant_type", "").endswith("device_code"):
-            cls = type(self)
-            if cls.pending_polls > 0:
-                cls.pending_polls -= 1
+            if state.pending_polls > 0:
+                state.pending_polls -= 1
                 body = {"error": "authorization_pending"}
             else:
-                body = {"access_token": cls.access_token, "refresh_token": "rt-55aa66bb",
-                        "expires_in": 3600, "scope": form.get("scope", "")}
+                body = state.grant(state.access_token)
         elif form.get("grant_type") == "refresh_token":
-            body = {"access_token": type(self).access_token, "expires_in": 3600}
+            with state.lock:
+                state.refreshes += 1
+            time.sleep(state.refresh_delay)
+            with state.lock:
+                live = form.get("refresh_token") in state.refresh_tokens
+                state.refresh_tokens.discard(form.get("refresh_token"))
+            body = state.grant(state.refreshed_token) if live else \
+                {"error": "invalid_grant", "error_description": "AADSTS70000: the refresh token was already used"}
         else:
             body = {"error": "unsupported"}
         data = json.dumps(body).encode()
@@ -118,12 +172,35 @@ class _FakeAuthority(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class _Authority:
+    """What the fake identity platform hands out; tests change it and read what it saw."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.access_token = SECRET  # from the device code sign-in
+        self.refreshed_token = SECRET  # from a refresh
+        self.pending_polls = 1  # "authorization_pending" answers before the sign-in completes
+        self.refresh_delay = 0.0
+        self.refreshes = 0
+        self.scopes: list[str] = []  # scope of each device code request
+        self.refresh_tokens: set[str] = set()  # the ones that still work
+        self.id_tokens: list[str] = []
+
+    def grant(self, access_token: str) -> dict:
+        with self.lock:
+            refresh_token = REFRESH if not self.id_tokens else f"{REFRESH}-{len(self.id_tokens)}"
+            self.refresh_tokens.add(refresh_token)
+            self.id_tokens.append(_id_token({"preferred_username": ACCOUNT, "name": "Ada Lovelace"}))
+            return {"access_token": access_token, "refresh_token": refresh_token, "expires_in": 3600,
+                    "id_token": self.id_tokens[-1], "scope": "Mail.Read openid profile offline_access"}
+
+
 @pytest.fixture
 def fake_authority(monkeypatch):
-    _FakeAuthority.pending_polls = 1
+    _FakeAuthority.state = state = _Authority()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeAuthority)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("OMEGA_CONNECT_OAUTH_AUTHORITY", f"http://127.0.0.1:{server.server_port}")
-    yield server
+    yield state
     server.shutdown()

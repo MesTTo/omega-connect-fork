@@ -3,7 +3,9 @@
 Used for Microsoft 365: a person runs the `connect` action, gets a short code
 and a sign-in address, signs in with their own account and consents to the
 scopes the server needs. Tokens never leave the app: they are kept encrypted
-in the store and turned into an Authorization header just before a call.
+in the store and turned into an Authorization header just before a call. With
+the `openid` and `profile` scopes the identity provider also sends an id_token;
+only its preferred_username is kept, to show who signed in.
 
 Standard library only. The authority defaults to the Microsoft identity
 platform; OMEGA_CONNECT_OAUTH_AUTHORITY overrides it (tests use a local fake).
@@ -11,6 +13,7 @@ platform; OMEGA_CONNECT_OAUTH_AUTHORITY overrides it (tests use a local fake).
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -111,16 +114,34 @@ def refresh(tenant: str, client_id: str, scopes: list[str], record: dict) -> dic
     new = _token_record(data)
     if not new.get("refresh_token"):
         new["refresh_token"] = record["refresh_token"]
+    if not new.get("account") and record.get("account"):
+        new["account"] = record["account"]
     return new
 
 
 def _token_record(data: dict) -> dict:
-    return {
+    record = {
         "access_token": data["access_token"],
         "refresh_token": data.get("refresh_token"),
         "expires_at": time.time() + int(data.get("expires_in", 3600)),
         "scope": data.get("scope", ""),
     }
+    account = account_name(data.get("id_token"))
+    if account:
+        record["account"] = account  # the id_token itself is not kept
+    return record
+
+
+def account_name(id_token: str | None) -> str | None:
+    """preferred_username from an id_token, only to show who signed in. The signature is not
+    checked, so nothing may be decided on this value."""
+    try:
+        payload = id_token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        name = claims.get("preferred_username")
+    except Exception:
+        return None
+    return name[:200] if isinstance(name, str) and name.strip() else None
 
 
 def needs_refresh(record: dict, margin: float = 120.0) -> bool:

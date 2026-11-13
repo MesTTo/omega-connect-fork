@@ -63,6 +63,10 @@ def test_views_and_results_pass_the_hives_own_checks(program, demo_url):
     assert person("add-server", name="bad", url="http://example.com/mcp")["status"] == "refused"
     assert person("add-server", name="demo", url=demo_url)["status"] == "done"
     assert views() == {"server"}
+    assert person("list-tools", ["server:demo"])["status"] == "done"
+    stale = person("accept-reads", ["server:demo"], base_revision="r-old")
+    assert stale["status"] == "stale" and stale["graph"]["items"]
+    assert person("accept-reads", ["server:demo"])["status"] == "done"
     statuses = [
         mind("list-servers", "k1")["status"],
         mind("list-tools", "k2", server="demo")["status"],

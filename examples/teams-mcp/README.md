@@ -74,21 +74,30 @@ does not accept `organizations`.
                        "https://graph.microsoft.com/ChannelMessage.Send"]}}
 ```
 
-omega-connect adds `offline_access` so the token can be refreshed.
+omega-connect adds `openid` and `profile` (to show who signed in) and
+`offline_access` (so the token can be renewed).
 
-**2. connect** (person, confirmed), on `server:teams`. The result (and the
-app's view) shows a code and `https://microsoft.com/devicelogin`. Sign in there
-with the tenant account and accept the permissions. The app finishes the
-sign-in by itself; the view then shows `Sign-in: oauth-device (signed in)`.
+**2. connect** (person, confirmed), on `server:teams`. The result shows a code
+and `https://microsoft.com/devicelogin`, to this person only: the app's view
+never shows the code. Sign in there with the tenant account and accept the
+permissions. The app finishes the sign-in by itself; the view then shows
+`Sign-in: oauth-device (signed in as <the account>)`.
 
-**3. list-tools** (mind) with `{"server": "teams"}`. Expected classes:
-`list_teams`, `list_channels` and `read_channel_messages` are `read`;
-`post_channel_message` is `write`.
+**3. list-tools** (mind) with `{"server": "teams"}`. Every tool is `write` for
+now: the three Graph reads carry `"review": "not reviewed"`, because a
+server's read-only hint counts only once a person has accepted it.
 
-**4. Find the channel** (mind, read-tool): `{"server": "teams", "tool": "list_teams"}`,
+**4. accept-reads** (person, confirmed), on `server:teams`, after looking at
+the tools in the view. `list_teams`, `list_channels` and
+`read_channel_messages` become `read`; `post_channel_message` stays `write`,
+since the server does not mark it read-only. If the server later changes one
+of the accepted definitions, that tool is `write` again and the view says
+*changed since review*.
+
+**5. Find the channel** (mind, read-tool): `{"server": "teams", "tool": "list_teams"}`,
 then `{"server": "teams", "tool": "list_channels", "arguments": {"team_id": "<team id>"}}`.
 
-**5. read-tool reads the channel** (mind, runs on *allow*):
+**6. read-tool reads the channel** (mind, runs on *allow*):
 
 ```json
 {"server": "teams", "tool": "read_channel_messages",
@@ -100,7 +109,7 @@ sender, subject and plain text of each message, labelled as data, not
 instructions. Asking read-tool for `post_channel_message` is refused: it is
 classed `write`.
 
-**6. use-tool posts, and waits for a person** (mind, *ask*):
+**7. use-tool posts, and waits for a person** (mind, *ask*):
 
 ```json
 {"server": "teams", "tool": "post_channel_message",
@@ -140,6 +149,7 @@ before any call, the size caps, the token of each request forwarded as it is,
 no call without a token, Graph errors explained without the token, nothing
 logged with the token, the `127.0.0.1` binding, Host and Origin checks, and the
 real transport not following redirects. The last test runs the demo above
-through omega-connect's actions in the repository's fake hive (sign-in included,
-identity platform in memory) and checks that the token never appears in
-results, views, the store or the logs. They pass with MCP SDK 1.x and 2.x.
+through omega-connect's actions in the repository's fake hive (sign-in and the
+review of the reads included, identity platform in memory) and checks that the
+token never appears in results, views, the store or the logs. They pass with
+MCP SDK 1.x and 2.x.

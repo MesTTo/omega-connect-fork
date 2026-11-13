@@ -3,7 +3,8 @@
 Layout under OMEGA_CONNECT_DATA_DIR (default ~/.omega-connect), one folder per
 swarm (named by a digest of the swarm id):
 
-    servers.json   server records, no secrets
+    servers.json   server records, no secrets; each keeps the tools a person
+                   accepted as read, with the digest of the definition accepted
     secrets.bin    OAuth tokens, encrypted with Fernet (AES-128-CBC + HMAC)
     trace.jsonl    one line per tool call: digests only, never content
     intents.json   app-level idempotency records for use-tool
@@ -126,6 +127,20 @@ class SwarmStore:
                 reclass[tool] = cls
             self._save_servers(servers)
 
+    def accept_reads(self, server: str, digests: dict[str, str], by: str, whole_server: bool) -> None:
+        """Record that a person accepted these tools as read: {tool: digest of its definition}.
+        For the whole server the list replaces the earlier one."""
+        with self.lock:
+            servers = self.servers()
+            record = servers.get(server)
+            if record is None:
+                raise StoreError("unknown_server", f"no server named '{server}'")
+            reviewed = {} if whole_server else record.get("reviewed", {})
+            at = int(time.time())
+            reviewed.update({tool: {"digest": value, "by": by, "at": at} for tool, value in digests.items()})
+            record["reviewed"] = reviewed
+            self._save_servers(servers)
+
     # ---------------------------------------------------------- credentials
     def _secrets(self) -> dict:
         path = self.dir / "secrets.bin"
@@ -146,6 +161,17 @@ class SwarmStore:
             secrets = self._secrets()
             secrets[server] = value
             self._save_secrets(secrets)
+
+    def replace_credentials(self, server: str, old: dict, new: dict) -> bool:
+        """Store `new` only if the stored credentials are still `old`, so a renewal that finishes
+        after a revoke or a new sign-in never writes over them."""
+        with self.lock:
+            secrets = self._secrets()
+            if secrets.get(server) != old:
+                return False
+            secrets[server] = new
+            self._save_secrets(secrets)
+            return True
 
     def delete_credentials(self, server: str) -> bool:
         with self.lock:

@@ -9,6 +9,7 @@ through omega-connect's actions in the fake hive of ../../tests.
 """
 
 import asyncio
+import base64
 import http.client
 import importlib.util
 import json
@@ -384,21 +385,25 @@ def test_the_real_transport_follows_no_redirect(teams):
 # ------------------------------------------------------------------ the README demo
 
 def test_the_demo_through_omega_connect(program, url, graph, tmp_path, monkeypatch, caplog):
-    """add-server with an oauth-device sign-in, connect, list-tools, read-tool on the channel, then use-tool
-    waiting for a person and posting once approved. The token stays between omega-connect and Graph."""
+    """add-server with an oauth-device sign-in, connect, list-tools, accept-reads, read-tool on the channel,
+    then use-tool waiting for a person and posting once approved. The token stays between omega-connect and
+    Graph."""
     caplog.set_level(logging.DEBUG)
     from cryptography.fernet import Fernet
 
     monkeypatch.setenv("OMEGA_CONNECT_DATA_DIR", str(tmp_path / "store"))
     monkeypatch.setenv("OMEGA_CONNECT_SECRET_KEY", Fernet.generate_key().decode())
     asked = []
+    claims = base64.urlsafe_b64encode(json.dumps({"preferred_username": "ada@omegademo.example"}).encode())
+    id_token = f"eyJhbGciOiJSUzI1NiJ9.{claims.decode().rstrip('=')}.c2ln"
 
     def identity_platform(address, form):  # the Microsoft identity platform, in memory
         asked.append((address, form.get("scope")))
         if address.endswith("/devicecode"):
             return {"device_code": "dev-1", "user_code": "ABCD-1234", "expires_in": 60, "interval": 1,
                     "verification_uri": "https://microsoft.com/devicelogin"}
-        return {"access_token": TOKEN, "refresh_token": REFRESH, "expires_in": 3600, "scope": " ".join(SCOPES)}
+        return {"access_token": TOKEN, "refresh_token": REFRESH, "expires_in": 3600, "scope": " ".join(SCOPES),
+                "id_token": id_token}
 
     monkeypatch.setattr(program.oauth_mod, "_post", identity_platform)
     hive = FakeHive(program)
@@ -425,8 +430,16 @@ def test_the_demo_through_omega_connect(program, url, graph, tmp_path, monkeypat
             break
         time.sleep(0.1)
     assert asked[0] == (f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode",
-                        " ".join(SCOPES + ["offline_access"]))
+                        " ".join(SCOPES + ["openid", "profile", "offline_access"]))
+    server_item = next(i for i in run(hive.view(SWARM, PERSON))["items"] if i["id"] == "server:teams")
+    assert "signed in as ada@omegademo.example" in server_item["text"] and "ABCD-1234" not in server_item["text"]
 
+    tools = mind("list-tools", "k1", server="teams")["detail"]["tools"]["teams"]
+    assert {tool["name"]: tool["class"] for tool in tools} == dict.fromkeys(
+        ("list_teams", "list_channels", "read_channel_messages", "post_channel_message"), "write")
+    accepted = person("accept-reads", ["server:teams"], {})  # a person looks at the tools and accepts the reads
+    assert accepted["detail"] == {"accepted": ["list_channels", "list_teams", "read_channel_messages"],
+                                  "still_write": ["post_channel_message"]}
     tools = mind("list-tools", "k1", server="teams")["detail"]["tools"]["teams"]
     assert {tool["name"]: tool["class"] for tool in tools} == {
         "list_teams": "read", "list_channels": "read", "read_channel_messages": "read",
@@ -453,5 +466,5 @@ def test_the_demo_through_omega_connect(program, url, graph, tmp_path, monkeypat
     outputs.append(run(hive.view(SWARM, PERSON)))
     stored = "".join(p.read_text("utf-8", errors="ignore") for p in (tmp_path / "store").rglob("*") if p.is_file())
     blob = json.dumps(outputs) + caplog.text + stored
-    assert TOKEN not in blob and REFRESH not in blob
+    assert TOKEN not in blob and REFRESH not in blob and id_token not in blob
     program.ENGINE.forget(SWARM, "teams")

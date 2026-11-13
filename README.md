@@ -2,8 +2,9 @@
 
 An OmegaHive app that lets the minds in a hive use outside tools through MCP
 servers (Microsoft 365, Dataverse, GitHub, Slack, Notion...). Reads run under
-the owner's choice of permission; every write goes through `use-tool`, which
-the owner normally keeps on "ask", so a person approves each one.
+the owner's choice of permission, once a person has accepted the tools as
+reads; every write goes through `use-tool`, which the owner normally keeps on
+"ask", so a person approves each one.
 
 Built against the "Omega tool connections: starter brief" (12 Nov 2026) and
 program contract 0.2 as described in
@@ -26,15 +27,54 @@ opens around 19–20 November.
 | `read-tool` | yes | read | Runs a tool only if it is classed `read` |
 | `use-tool` | yes | (write) | Runs any visible tool; the owner keeps it on "ask" |
 | `add-server`, `remove-server` | no | confirm | People only |
-| `reclass-tool` | no | confirm | Make a tool `write` or `hidden` (never promote to `read`) |
+| `accept-reads` | no | confirm | Accept the tools a server marks read-only as reads: a whole server, or one tool |
+| `reclass-tool` | no | confirm | Make a tool `write` or `hidden`, or back to `default` (never `read`) |
 | `connect`, `revoke` | no | confirm | OAuth device-code sign-in inside the app, and its removal |
 
 Parameters for the tool actions: `server`, `tool`, `arguments` (a JSON object,
 or a string holding one). They are also `binding_params`, so an approval binds
 to the exact server, tool and arguments.
 
-A tool is `read` only when the server marks it `readOnlyHint` **and** the owner
-has not reclassed it. Everything else is `write`.
+A tool is `read` only when the server marks it `readOnlyHint`, **a person has
+accepted it** with `accept-reads`, its definition is **still the one they
+accepted**, and the owner has not reclassed it. Everything else is `write`.
+`list-tools` says why with a `review` field: `accepted`, `not reviewed` or
+`changed since review`.
+
+## Reads are reviewed by a person
+
+MCP annotations are hints from the server, not guarantees: an untrusted or
+compromised server can label a delete as read-only. So every tool of a newly
+added server is `write`, whatever it claims, until a person accepts its reads:
+
+1. Someone runs `list-tools` on the server, which loads its tools into the view.
+2. A person looks at them and runs `accept-reads` on the server (all the tools
+   it marks read-only) or on one tool. Only tools marked `readOnlyHint` can be
+   accepted; the others stay `write`.
+3. After that the owner can only make a tool stricter: `reclass-tool` sets
+   `write` or `hidden`, and `default` goes back to what the review says.
+
+For each accepted tool the store keeps a **digest of its definition** as the
+server sent it (sha256 of the name, the full description, the input schema
+and the annotations), with who accepted it and when. A tool whose definition
+no longer matches drops back to `write`, and the view marks it *changed since
+review* until a person accepts it again. The app loads the tool list again
+when the server sends `notifications/tools/list_changed` and whenever it opens
+a session (also after a server restart: the server answers the old session
+with 404, and the app opens a new one). A call goes out only while the
+session still has the definition it was classed by.
+
+`accept-reads` applies to the definitions loaded in the app, the ones the view
+shows, without connecting again. The view's revision covers their digests, so
+if the server changed them after the person looked, the act comes back
+`stale`.
+
+**What the digest does not catch.** It detects changes in a tool's
+definition, not in its behaviour. A server can keep a definition unchanged and
+make the tool do something else, behave differently for some arguments or some
+callers, or put a different service behind the same name. Accepting reads
+means trusting the server's word for those definitions; for a server you do
+not trust, accept nothing, and every call goes through `use-tool` and a person.
 
 ## What the app guarantees
 
@@ -44,6 +84,13 @@ has not reclassed it. Everything else is `write`.
   and the key in `OMEGA_CONNECT_SECRET_KEY`; without that key the app refuses
   to store them. Tokens never appear in results, `view()`, traces, logs or
   errors: every outgoing text is scrubbed of the values tied to the server.
+- **Token renewal without races.** An OAuth token is renewed shortly before
+  it expires, one renewal at a time per server and swarm (Entra rotates
+  refresh tokens, so two renewals at once would spend the same one), after
+  checking again that it is still due, and in a thread, so the hive's event
+  loop keeps running. The renewed token opens a new MCP session, since headers
+  are fixed when a session opens; a call already running finishes on the old
+  one. A renewal that ends after a `revoke` never brings the token back.
 - **Tool output is untrusted data.** Results are capped at 8,000 characters,
   returned as `{"untrusted": true, "text": ...}` and labelled as data, not
   instructions. Server-provided descriptions are cleaned and capped too.
@@ -77,6 +124,7 @@ Optional settings: `OMEGA_CONNECT_DATA_DIR` (store, default `~/.omega-connect`),
 (default `https://login.microsoftonline.com`).
 
 Then attach a mind, for example `read-tool` on allow and `use-tool` on ask.
+`read-tool` runs only the tools a person has accepted as reads (above).
 
 ## Add a server (person, confirmed)
 
@@ -96,8 +144,16 @@ least-privilege scopes, consent by the person who runs `connect`):
             "client_id": "<application id>", "scopes": ["ChannelMessage.Read.All"]}}
 ```
 
-`connect` returns a code and a sign-in address; the app finishes the sign-in on
-its own once the person has signed in. `revoke` deletes the token.
+omega-connect adds `openid` and `profile` (so the identity provider says who
+signed in) and `offline_access` (so the token can be renewed) to the scopes.
+
+`connect` returns a code and a sign-in address to the person who ran it, and
+only to them: the view never shows the code, so nobody else in the swarm can
+finish that sign-in with their own account. The app finishes the sign-in on
+its own once the person has signed in. The view then shows the account that
+signed in (`preferred_username` from the id_token, kept only to show it; the
+id_token itself is not stored), which is the account every mind in the swarm
+acts as on that server. `revoke` deletes the token.
 
 The parameter is `signin` rather than `auth` because the host refuses request
 bodies with credential-like keys.
@@ -106,8 +162,11 @@ bodies with credential-like keys.
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 35 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 47 tests, mock MCP servers on localhost, no outside network
 ```
+
+Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
+1.30.
 
 `tests/fakehive.py` is a small stand-in for the host that follows the public
 contract notes and `hive/PROGRAMS.md`: agent flag, no default allow, approvals
@@ -134,44 +193,62 @@ Coverage against the brief's definition of done:
 | `programs_check` passes | COMPATIBLE with the pre-release copy: `cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-connect`. It sees only an empty view, so `test_contract.py` checks fuller views and every result with the hive's validators |
 | Live demo: read a Teams channel, then a write a person approves | to do on a scratch hive; server and steps in `examples/teams-mcp/`, whose last test rehearses them offline |
 
+Coverage of the first review's changes:
+
+| Change | Tests |
+|---|---|
+| Every tool of a new server is `write` until a person accepts its reads (people only, confirmed; whole server or one tool; only `readOnlyHint` tools) | `test_a_new_servers_tools_stay_write_until_a_person_accepts_its_reads`, `test_accept_reads_for_one_tool` |
+| The owner can only make a tool stricter | `test_the_owner_can_only_make_a_tool_stricter` |
+| A changed definition drops back to `write`, the view says *changed since review*; `tools/list_changed` reloads the list; the digest covers the full description | `test_a_changed_tool_definition_drops_back_to_write`, `test_a_tool_relabelled_read_only_after_the_review_stays_write` |
+| The list is loaded again on every new session, also after a server restart (HTTP 404 for the old session) | `test_a_restarted_server_gets_a_new_session_with_its_tools_loaded_again` |
+| `accept-reads` applies to the definitions the person saw | `test_accepting_reads_needs_the_page_the_person_saw` |
+| A call goes out only on the definition it was classed by | `test_a_call_goes_out_only_on_the_definition_it_was_checked_against` (engine) |
+| The device code only in the `connect` result; the view shows the account that signed in | `test_device_code_sign_in_and_revoke` |
+| Token renewal: off the event loop, once at a time per server, never over a revoke | `test_a_token_renewal_does_not_block_the_event_loop`, `test_calls_on_several_loops_renew_the_token_once`, `test_a_renewal_that_ends_after_a_revoke_does_not_bring_the_token_back` |
+| A renewed token opens a new session; the call running on the old one finishes | `test_a_renewed_token_opens_a_new_session`, `test_a_call_running_when_the_token_is_renewed_finishes_on_its_session` |
+
 ## Open points for the flagship team
 
 Checked against `hive/PROGRAMS.md` in the pre-release copy of omegahive
-(04fc3f2): sections 1–5, "Read actions" and 9d.
+(04fc3f2): sections 1–5, "Read actions" and 9d. The first review (Dot, for Jon
+Grove, on 8051f30) answered each of them.
 
 1. **Settled: `use-tool` declares no effect.** The contract defines only
    `"effect": "read"`, for actions that change nothing and are safe to repeat;
    anything else keeps the ordinary contract, which is what a write needs.
-   `USE_TOOL_EFFECT` in `program.py` stays `None`.
-2. `applies_to` for actions that do not target an item (`list-servers`,
-   `add-server`): currently `["server"]`. The contract shows `applies_to` only
-   as a list of kinds and says nothing about actions without an item.
+   `USE_TOOL_EFFECT` in `program.py` stays `None`. The review confirmed this
+   reading of the contract.
+2. **Settled: `applies_to` for actions that do not target an item**
+   (`list-servers`, `add-server`) stays `["server"]`. The contract shows
+   `applies_to` only as a list of kinds and says nothing about actions without
+   an item; the review found this choice fine.
 3. **Settled: `act()` is not told who approved.** `ctx.command` carries the
    request identity: `idempotency_key`, `record_id`, and `prior_failed` when a
-   failed attempt is delivered again. Traces now keep `record_id`, which ties
-   each call to the hive's own record of the act. Still to confirm: that this
-   record names the person who approved a mind's act on "ask" (the contract
-   does not describe the "ask" flow).
-4. Microsoft 365 consent per person: today a server uses the token of the
-   person who last ran `connect`. Choosing a token per acting mind needs to
-   know which person a mind acts for, and the contract does not say. Section
-   9d mentions an action field `approver: "person"` (only a named person may
+   failed attempt is delivered again. Traces keep `record_id`, which ties each
+   call to the hive's own record of the act. The review confirmed this reading
+   of the contract.
+4. **With the flagship team: which person a mind acts for.** Today a server
+   uses the token of the person who last completed `connect`, and the view
+   shows which account that is. Choosing a token per acting mind needs to know
+   which person a mind acts for, and the contract does not say. Section 9d
+   mentions an action field `approver: "person"` (only a named person may
    confirm, never the local operator password); it may suit `connect`, whose
    token belongs to whoever signs in, but the copy does not define it further.
-5. The mind skill for native Omega minds (brief, "a second, smaller piece").
-6. Failed writes delivered again: section 9d describes `prior_failed` for acts
-   a person confirms in the host. `use-tool` reaches the app through a mind's
-   "ask" approval; the app and `tests/fakehive.py` assume the same rules there
-   (a failed attempt runs again only after a new approval, with the same
-   `record_id` and `prior_failed`). To confirm.
+5. **Agreed, as a separate small piece:** the mind skill for native Omega
+   minds (brief, "a second, smaller piece").
+6. **With the flagship team: failed writes delivered again after "ask".**
+   Section 9d describes `prior_failed` for acts a person confirms in the host.
+   `use-tool` reaches the app through a mind's "ask" approval; the app and
+   `tests/fakehive.py` assume the same rules there (a failed attempt runs again
+   only after a new approval, with the same `record_id` and `prior_failed`).
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `plugin.json`, `program.py` | App identity and the host program (`describe` / `view` / `act`) |
-| `connect/engine.py` | MCP sessions: one long-lived task per server on a private event loop |
-| `connect/store.py` | Per-swarm servers, encrypted credentials, traces, intents |
+| `connect/engine.py` | MCP sessions: one long-lived task per server on a private event loop; tool lists and their definition digests |
+| `connect/store.py` | Per-swarm servers (with the reads a person accepted), encrypted credentials, traces, intents |
 | `connect/oauth.py` | OAuth 2.0 device authorization grant (standard library only) |
 | `tests/` | Fake host, mock MCP server, fake identity provider, tests |
 | `examples/teams-mcp/` | Microsoft Teams MCP server over Graph for the live demo (127.0.0.1 only), its tests and the demo steps |
