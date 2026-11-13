@@ -22,7 +22,7 @@ What the app guarantees on its side
   results, views, traces, logs or errors.
 - Tool output is returned as data, capped in size, and labelled untrusted.
 - Every call is traced with server, tool, digests of arguments and result,
-  status, actor and the hive's record id for the act.
+  status, actor, who approved it and the hive's record id for the act.
 - Streamable HTTP by default. stdio servers (which start processes on the
   hive's machine) are refused unless OMEGA_CONNECT_ALLOW_STDIO=1.
 - Everything is scoped to the calling swarm.
@@ -157,6 +157,14 @@ def _command(ctx, name: str) -> Any:
     prior_failed."""
     command = getattr(ctx, "command", None)
     return command.get(name) if isinstance(command, dict) else getattr(command, name, None)
+
+
+def _approval(ctx) -> dict:
+    """The approval the hive redeemed for this act, ctx.actor.approval = {id, binding_digest,
+    approved_by}, approved_by being the approver's principal; {} when no person approved it."""
+    actor = getattr(ctx, "actor", None)
+    approval = actor.get("approval") if isinstance(actor, dict) else getattr(actor, "approval", None)
+    return approval if isinstance(approval, dict) else {}
 
 
 def _intent_key(ctx, params: dict) -> str | None:
@@ -450,7 +458,8 @@ def view(ctx, focus, stage):
         target = f"{entry.get('server')}/{entry['tool']}" if entry.get("tool") else str(entry.get("server"))
         items.append({"id": cid, "kind": "call", "label": f"{entry.get('action')} {target}",
                       "text": "\n".join(f"{k}: {entry[k]}" for k in
-                                        ("at", "status", "actor", "record_id", "arguments_digest", "result_digest")
+                                        ("at", "status", "actor", "approved_by", "record_id", "arguments_digest",
+                                         "result_digest")
                                         if entry.get(k))})
         tid = f"tool:{entry.get('server')}/{entry.get('tool')}"
         if tid in known:
@@ -614,7 +623,9 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments, sending=
     attempted is False when the call never went out, so a retry may still run it.
     sending() runs just before each call goes out."""
     secrets = _secrets_for(store, record)
+    approval = _approval(ctx)
     trace = {"action": action, "server": record["name"], "tool": tool, "actor": _actor(ctx),
+             "approved_by": approval.get("approved_by"), "approval_id": approval.get("id"),
              "record_id": _command(ctx, "record_id"), "arguments_digest": store_mod.digest(arguments)}
     # The class is checked against the definition the session holds, and the call goes out only
     # while it still holds that one. If the list is reloaded in between (tools/list_changed, a
