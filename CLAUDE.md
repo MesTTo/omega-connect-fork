@@ -85,7 +85,7 @@ The device code goes only into the `connect` result, never into `view()`.
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests            # 49 tests, ~55 s, localhost only
+python -m pytest -q tests            # 50 tests, ~55 s, localhost only
 python -m pytest -q examples/teams-mcp   # 30 tests, ~13 s, Graph simulated in memory
 ```
 
