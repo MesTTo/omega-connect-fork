@@ -43,7 +43,7 @@ TENANT = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 CLIENT_ID = "11111111-2222-3333-4444-555555555555"
 SCOPES = [f"https://graph.microsoft.com/{name}" for name in
           ("Team.ReadBasic.All", "Channel.ReadBasic.All", "ChannelMessage.Read.All", "ChannelMessage.Send")]
-SWARM, PERSON, MIND = "demo", "person:ada", "mind:scout"
+SWARM, PERSON, MIND = "demo", "ada", "scout"
 
 
 def _load(path: Path, name: str):
@@ -415,8 +415,8 @@ def test_the_demo_through_omega_connect(program, url, graph, tmp_path, monkeypat
         outputs.append(run(hive.person_act(SWARM, PERSON, action, items, params, confirmed=True)))
         return outputs[-1]
 
-    def mind(action, key, **params):
-        outputs.append(run(hive.agent_act(SWARM, MIND, action, params, key)))
+    def mind(action, key, approval_id=None, **params):
+        outputs.append(run(hive.agent_act(SWARM, MIND, action, params, key, approval_id)))
         return outputs[-1]
 
     outputs = []
@@ -454,10 +454,10 @@ def test_the_demo_through_omega_connect(program, url, graph, tmp_path, monkeypat
 
     post = {**where, "text": "Summary: the demo is at 3pm, agenda in the channel."}
     waiting = mind("use-tool", "w1", server="teams", tool="post_channel_message", arguments=post)
-    assert waiting["status"] == "pending_approval"
+    assert waiting["status"] == "approval_required"
     assert [r for r in graph.requests if r["method"] == "POST"] == []  # nothing posted before a person says yes
-    hive.approve(waiting["approvals"][0], PERSON)
-    done = mind("use-tool", "w1", server="teams", tool="post_channel_message", arguments=post)
+    hive.approve(waiting["approval_id"], PERSON)
+    done = mind("use-tool", "w1", waiting["approval_id"], server="teams", tool="post_channel_message", arguments=post)
     assert done["status"] == "done" and json.loads(done["detail"]["result"]["text"])["posted"]["id"]
     posts = [r for r in graph.requests if r["method"] == "POST"]
     assert len(posts) == 1 and posts[0]["body"]["body"]["content"] == post["text"]

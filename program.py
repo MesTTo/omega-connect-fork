@@ -7,6 +7,8 @@ Who may do what
   through `read-tool`, and call any tool through `use-tool`. The hive gates
   each action with the rule program:omega-connect:<action>; the owner normally
   allows read-tool and keeps use-tool on "ask", so a person approves each write.
+  A mind's use-tool runs only with a person's approval: under an "allow" rule
+  the app refuses it.
 - Only people add or remove servers, accept a server's read-only tools
   (`accept-reads`), reclass tools, sign in (`connect`) and revoke a sign-in.
   Those actions need the host's confirm dialog.
@@ -22,7 +24,7 @@ What the app guarantees on its side
   results, views, traces, logs or errors.
 - Tool output is returned as data, capped in size, and labelled untrusted.
 - Every call is traced with server, tool, digests of arguments and result,
-  status, actor and the hive's record id for the act.
+  status, actor, who approved it and the hive's record id for the act.
 - Streamable HTTP by default. stdio servers (which start processes on the
   hive's machine) are refused unless OMEGA_CONNECT_ALLOW_STDIO=1.
 - Everything is scoped to the calling swarm.
@@ -151,10 +153,25 @@ def _actor(ctx) -> str:
 
 def _command(ctx, name: str) -> Any:
     """A field of ctx.command, the request identity the hive sets for act():
-    idempotency_key, record_id, and prior_failed when it delivers again an
-    attempt that failed (PROGRAMS.md 9d). It does not say who approved."""
+    idempotency_key and record_id. The person route also sets prior_failed when
+    it delivers again an attempt that failed (PROGRAMS.md 9d); the agent route
+    delivers a mind's failed attempt again with the same record_id and no
+    prior_failed."""
     command = getattr(ctx, "command", None)
     return command.get(name) if isinstance(command, dict) else getattr(command, name, None)
+
+
+def _approval(ctx) -> dict:
+    """The approval the hive redeemed for this act, ctx.actor.approval = {id, binding_digest,
+    approved_by}, approved_by being the approver's principal; {} when no person approved it."""
+    actor = getattr(ctx, "actor", None)
+    approval = actor.get("approval") if isinstance(actor, dict) else getattr(actor, "approval", None)
+    return approval if isinstance(approval, dict) else {}
+
+
+def _actor_kind(ctx) -> str | None:
+    actor = getattr(ctx, "actor", None)
+    return actor.get("kind") if isinstance(actor, dict) else getattr(actor, "kind", None)
 
 
 def _intent_key(ctx, params: dict) -> str | None:
@@ -448,7 +465,8 @@ def view(ctx, focus, stage):
         target = f"{entry.get('server')}/{entry['tool']}" if entry.get("tool") else str(entry.get("server"))
         items.append({"id": cid, "kind": "call", "label": f"{entry.get('action')} {target}",
                       "text": "\n".join(f"{k}: {entry[k]}" for k in
-                                        ("at", "status", "actor", "record_id", "arguments_digest", "result_digest")
+                                        ("at", "status", "actor", "approved_by", "record_id", "arguments_digest",
+                                         "result_digest")
                                         if entry.get(k))})
         tid = f"tool:{entry.get('server')}/{entry.get('tool')}"
         if tid in known:
@@ -566,8 +584,8 @@ async def _inspect_tool(swarm, store, items, params):
 
 
 # The hive delivers an intent again after an attempt that failed with an unknown
-# effect (PROGRAMS.md 9d). If this app kept no record of that attempt, it may
-# still have reached the server, so the new result says so.
+# effect (PROGRAMS.md 9d). If that attempt went out and no result was kept, it may
+# have reached the server, so the new result says so.
 _PRIOR_FAILED = "An earlier attempt at this request failed with an unknown outcome and may already have taken effect."
 
 
@@ -580,27 +598,51 @@ async def _call_tool(ctx, swarm, store, action, items, params):
     request_digest = store_mod.digest({"action": action, "server": record["name"], "tool": tool,
                                        "arguments": arguments})
     intent = _intent_key(ctx, params) if action == "use-tool" else None
+    earlier = None
     if intent:
-        seen = store.intent(intent)
-        if seen is not None:
-            if seen["request"] != request_digest:
+        earlier = store.intent(intent)
+        if earlier is not None:
+            if earlier["request"] != request_digest:
                 return _refused("this idempotency key was used for a different request", detail={"type": "conflict"})
-            return seen["result"]
-    result, attempted = await _run_tool(ctx, swarm, store, action, record, tool, arguments)
-    if action == "use-tool" and _command(ctx, "prior_failed"):
+            if earlier.get("result") is not None:
+                return earlier["result"]
+    # An attempt that went out and kept no result left only this record, written just before the
+    # call (below). The agent route sends no prior_failed, so the record is how a mind's write
+    # delivered again is known.
+    unknown = bool(earlier) or bool(_command(ctx, "prior_failed"))
+
+    def sending():
+        if intent:
+            store.put_intent(intent, {"request": request_digest, "result": None, "at": time.time()})
+
+    result, attempted = await _run_tool(ctx, swarm, store, action, record, tool, arguments, sending)
+    if action == "use-tool" and unknown:
         result = {**result, "message": f"{_PRIOR_FAILED} {result['message']}".strip(),
                   "detail": {**(result.get("detail") or {}), "prior_failed": True}}
     if intent and attempted:
         store.put_intent(intent, {"request": request_digest, "result": result, "at": time.time()})
+    elif intent and not earlier:
+        store.drop_intent(intent)  # nothing went out this time, and nothing earlier is unknown
     return result
 
 
-async def _run_tool(ctx, swarm, store, action, record, tool, arguments):
+async def _run_tool(ctx, swarm, store, action, record, tool, arguments, sending=lambda: None):
     """Connect, check the tool's class, call it and trace. Returns (result, attempted):
-    attempted is False when the call never went out, so a retry may still run it."""
+    attempted is False when the call never went out, so a retry may still run it.
+    sending() runs just before each call goes out."""
     secrets = _secrets_for(store, record)
+    approval = _approval(ctx)
     trace = {"action": action, "server": record["name"], "tool": tool, "actor": _actor(ctx),
+             "approved_by": approval.get("approved_by"), "approval_id": approval.get("id"),
              "record_id": _command(ctx, "record_id"), "arguments_digest": store_mod.digest(arguments)}
+    if action == "use-tool" and _actor_kind(ctx) == "mind" and not approval:
+        # The brief: every write is approved by a person. A mind's rule can still say "allow", for
+        # instance a pattern the owner wrote for its reads that also matches use-tool, so the app
+        # itself asks for the person.
+        store.trace({**trace, "status": "refused", "reason": "no-approval"})
+        return _refused("a person approves every use-tool call a mind makes: the owner keeps use-tool on "
+                        "\"ask\" for minds, and the mind sends the request again with the approval; reads go "
+                        "through read-tool", detail={"type": "approval_needed"}), False
     # The class is checked against the definition the session holds, and the call goes out only
     # while it still holds that one. If the list is reloaded in between (tools/list_changed, a
     # reconnect), nothing is sent and the tool is classed once more by its new definition.
@@ -620,6 +662,7 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments):
             store.trace({**trace, "status": "refused", "reason": "write-classed"})
             return _refused(_write_reason(tool, review),
                             detail={"class": cls, **({"review": review} if review else {})}), False
+        sending()
         try:
             outcome = await ENGINE.call(swarm, spec, tool, arguments, retry_on_drop=(cls == READ), expect=info.digest)
             break

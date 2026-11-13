@@ -3,8 +3,9 @@
 An OmegaHive app that lets the minds in a hive use outside tools through MCP
 servers (Microsoft 365, Dataverse, GitHub, Slack, Notion...). Reads run under
 the owner's choice of permission, once a person has accepted the tools as
-reads; every write goes through `use-tool`, which the owner normally keeps on
-"ask", so a person approves each one.
+reads; every write goes through `use-tool`, which the owner keeps on "ask", so
+a person approves each one. The app refuses a mind's `use-tool` that no person
+approved, even under an "allow" rule.
 
 Built against the "Omega tool connections: starter brief" (12 Nov 2026) and
 program contract 0.2 as described in
@@ -26,7 +27,7 @@ opens around 19–20 November.
 | `list-tools` | yes | read | Tools per server, each classed `read` or `write` |
 | `inspect-tool` | yes | read | One tool's description and full input schema |
 | `read-tool` | yes | read | Runs a tool only if it is classed `read` |
-| `use-tool` | yes | (write) | Runs any visible tool; the owner keeps it on "ask" |
+| `use-tool` | yes | (write) | Runs any visible tool; a mind's call needs a person's approval ("ask") |
 | `add-server`, `remove-server` | no | confirm | People only |
 | `accept-reads` | no | confirm | Accept the tools a server marks read-only as reads: a whole server, or one tool |
 | `reclass-tool` | no | confirm | Make a tool `write` or `hidden`, or back to `default` (never `read`) |
@@ -96,7 +97,8 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
   returned as `{"untrusted": true, "text": ...}` and labelled as data, not
   instructions. Server-provided descriptions are cleaned and capped too.
 - **Every call is traced**: server, tool, digest of the arguments, digest of
-  the result, status, actor and the hive's record id for the act
+  the result, status, actor, who approved it and the approval's id
+  (`ctx.actor.approval`), and the hive's record id for the act
   (`ctx.command.record_id`). Content is never stored.
 - **Streamable HTTP by default.** `https://` only (plain `http` for localhost),
   no credentials in URLs. stdio servers start processes on the hive's machine
@@ -105,10 +107,13 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
 - **Idempotency twice.** The hive records intents; the app also keeps its own
   record for `use-tool`, so a retried write returns its recorded result. The
   hive promises at most one delivery per confirm, not exactly-once effects
-  (PROGRAMS.md 9d): when it delivers again an attempt that failed with an
-  unknown effect (`ctx.command.prior_failed`) and the app has no record of it,
-  `use-tool` runs the tool again and the result says the first attempt may
-  already have taken effect (`detail.prior_failed: true`).
+  (PROGRAMS.md 9d). Just before a `use-tool` call goes out, the app records
+  it without a result. When the hive delivers again an attempt that failed
+  with an unknown effect and that record has no result yet, `use-tool` runs
+  the tool again and the result says the first attempt may already have taken
+  effect (`detail.prior_failed: true`). The app needs its own record for this:
+  the hive's agent route delivers a mind's failed attempt again with the same
+  `record_id` and no `ctx.command.prior_failed`.
 
 ## Mount it in a hive
 
@@ -226,11 +231,15 @@ Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
 1.30.
 
 `tests/fakehive.py` is a small stand-in for the host that follows the public
-contract notes and `hive/PROGRAMS.md`: agent flag, no default allow, approvals
-bound to the exact request and redeemed once, idempotency keys, the hive's
-record id in `ctx.command` (never the approver), failed attempts delivered
-again with `prior_failed`, read actions stored as digests only, confirm for
-people's actions, refusal of identity and credential keys.
+contract notes and `hive/PROGRAMS.md`, and answers as
+`hive/core/program_actions.py` does: agent flag, no default allow,
+`approval_required` with an `approval_id` that the mind sends back once a
+person approves, approvals bound to the exact request and its key and
+redeemed once, the approval in `ctx.actor.approval`, the hive's record id in
+`ctx.command`, failed attempts delivered again with the same record id and no
+`prior_failed`, `base_revision` added to params, read actions stored as
+digests only, confirm for people's actions, refusal of identity and
+credential keys.
 
 `tests/test_contract.py` runs the app through the same fake host with the
 hive's own `validate_graph` and `validate_result` (`hive/core/programs.py`)
@@ -280,11 +289,13 @@ Grove, on 8051f30) answered each of them.
    (`list-servers`, `add-server`) stays `["server"]`. The contract shows
    `applies_to` only as a list of kinds and says nothing about actions without
    an item; the review found this choice fine.
-3. **Settled: `act()` is not told who approved.** `ctx.command` carries the
-   request identity: `idempotency_key`, `record_id`, and `prior_failed` when a
-   failed attempt is delivered again. Traces keep `record_id`, which ties each
-   call to the hive's own record of the act. The review confirmed this reading
-   of the contract.
+3. **Corrected: `act()` is told who approved.** PROGRAMS.md doesn't say so,
+   but `hive/core/program_actions.py` (`agent_act`, `_approval`) passes the
+   approval it redeemed as `ctx.actor.approval = {id, binding_digest,
+   approved_by}`, `approved_by` being the approver's principal; it is `None`
+   when no person approved. `ctx.command` carries the request identity:
+   `idempotency_key` and `record_id`. Traces keep the approver, the approval's
+   id and `record_id`, which ties each call to the hive's own record of the act.
 4. **With the flagship team: which person a mind acts for.** Today a server
    uses the token of the person who last completed `connect`, and the view
    shows which account that is. Choosing a token per acting mind needs to know
@@ -294,11 +305,11 @@ Grove, on 8051f30) answered each of them.
    token belongs to whoever signs in, but the copy does not define it further.
 5. **Agreed, as a separate small piece:** the mind skill for native Omega
    minds (brief, "a second, smaller piece").
-6. **With the flagship team: failed writes delivered again after "ask".**
-   Section 9d describes `prior_failed` for acts a person confirms in the host.
-   `use-tool` reaches the app through a mind's "ask" approval; the app and
-   `tests/fakehive.py` assume the same rules there (a failed attempt runs again
-   only after a new approval, with the same `record_id` and `prior_failed`).
+6. **Settled: failed writes delivered again after "ask".** Section 9d
+   describes `prior_failed` for acts a person confirms in the host. For a
+   mind, `hive/core/program_actions.py` (`agent_act`) delivers a failed
+   attempt again only after a new approval, with the same `record_id` and no
+   `prior_failed`, so the app keeps its own record of each call that went out.
 
 ## Layout
 
