@@ -13,8 +13,8 @@ import pytest
 from conftest import ACCOUNT, DEMO, NEW_TOKEN, REFRESH, SECRET
 from fakehive import FakeHive, HostRefusal, run, validate_graph
 
-PERSON = "person:ada"
-MIND = "mind:scout"
+PERSON = "ada"   # the hive's ids carry no kind; ctx.actor says the kind
+MIND = "scout"
 SIGNIN = {"kind": "oauth-device", "tenant": "organizations",
           "client_id": "11111111-2222-3333-4444-555555555555", "scopes": ["Mail.Read"]}
 
@@ -24,8 +24,8 @@ def add(hive, swarm, name, url=None, **extra):
     return run(hive.person_act(swarm, PERSON, "add-server", [], params, confirmed=True))
 
 
-def mind(hive, swarm, action, key, **params):
-    return run(hive.agent_act(swarm, MIND, action, params, key))
+def mind(hive, swarm, action, key, approval_id=None, **params):
+    return run(hive.agent_act(swarm, MIND, action, params, key, approval_id))
 
 
 def review(hive, swarm, server):
@@ -132,21 +132,21 @@ def test_use_tool_waits_for_a_person(hive, demo_url):
     review(hive, "s1", "demo")
     args = {"title": "plan", "text": 'call "Bob" today'}
     first = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
-    assert first["status"] == "pending_approval"
+    assert first["status"] == "approval_required" and first["approval_id"]
     assert mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"] \
         == "(no notes)"
-    hive.approve(first["approvals"][0], PERSON)
-    done = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
+    hive.approve(first["approval_id"], PERSON)
+    done = mind(hive, "s1", "use-tool", "w1", first["approval_id"], server="demo", tool="create_note", arguments=args)
     assert done["status"] == "done" and done["detail"]["result"]["text"] == "saved 'plan'"
     read = mind(hive, "s1", "read-tool", "r2", server="demo", tool="get_note", arguments={"title": "plan"})
     assert read["detail"]["result"]["text"] == 'call "Bob" today'
     # the approval was spent: a new request needs a new one
     again = mind(hive, "s1", "use-tool", "w2", server="demo", tool="create_note", arguments=args)
-    assert again["status"] == "pending_approval"
-    # act() is not told who approved; the trace keeps the hive's record id, and that record names the approver
+    assert again["status"] == "approval_required" and again["approval_id"] != first["approval_id"]
+    # the trace keeps the hive's record id, and that record names the approver
     calls = [i["text"] for i in run(hive.view("s1", PERSON))["items"] if i["label"].startswith("use-tool")]
     record_id = re.search(r"^record_id: (\S+)$", calls[0], re.M).group(1)
-    assert hive.record(record_id)["approved_by"] == PERSON
+    assert hive.record(record_id)["approved_by"] == f"user:{PERSON}"
 
 
 def test_identical_retry_returns_the_recorded_result(hive, demo_url):
@@ -202,15 +202,18 @@ def test_a_write_delivered_again_after_a_failure_warns_it_may_repeat(hive, demo_
 
     monkeypatch.setattr(store_cls, "put_intent", lose_the_record)
     first = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
-    hive.approve(first["approvals"][0], PERSON)
+    hive.approve(first["approval_id"], PERSON)
     with pytest.raises(HostRefusal) as failed:
-        mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
+        mind(hive, "s1", "use-tool", "w1", first["approval_id"], server="demo", tool="create_note", arguments=args)
     assert failed.value.code == "program_error"
     assert mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"] == "plan"
+    with pytest.raises(HostRefusal) as spent:  # the spent approval does not cover a second delivery
+        mind(hive, "s1", "use-tool", "w1", first["approval_id"], server="demo", tool="create_note", arguments=args)
+    assert spent.value.code == "not_approved"
     again = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
-    assert again["status"] == "pending_approval"  # the spent approval does not cover a second delivery
-    hive.approve(again["approvals"][0], PERSON)
-    done = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
+    assert again["status"] == "approval_required" and again["approval_id"] != first["approval_id"]
+    hive.approve(again["approval_id"], PERSON)
+    done = mind(hive, "s1", "use-tool", "w1", again["approval_id"], server="demo", tool="create_note", arguments=args)
     assert done["status"] == "done" and done["detail"]["prior_failed"] is True
     assert "may already have taken effect" in done["message"]
     assert done["detail"]["result"]["text"] == "saved 'plan'"
@@ -284,8 +287,8 @@ def test_a_new_servers_tools_stay_write_until_a_person_accepts_its_reads(hive, d
         run(hive.person_act("s1", PERSON, "accept-reads", ["server:demo"], {}))
     assert unconfirmed.value.code == "confirm_required"
 
-    accepted = run(hive.person_act("s1", PERSON, "accept-reads", ["server:demo"],
-                                   {"base_revision": seen["revision"]}, confirmed=True))
+    accepted = run(hive.person_act("s1", PERSON, "accept-reads", ["server:demo"], {}, confirmed=True,
+                                   base_revision=seen["revision"]))
     assert accepted["status"] == "done"
     assert accepted["detail"]["still_write"] == ["create_note", "delete_notes", "redefine"]
     assert {"add", "get_note", "list_notes"} <= set(accepted["detail"]["accepted"])
@@ -366,8 +369,8 @@ def test_a_changed_tool_definition_drops_back_to_write(hive, demo_url):
     assert "changed since review" in item["text"] and item["flags"] == ["changed-since-review"]
     assert any("changed since review" in note for note in seen["notes"])
 
-    again = run(hive.person_act("s1", PERSON, "accept-reads", ["tool:demo/add"],
-                                {"base_revision": seen["revision"]}, confirmed=True))
+    again = run(hive.person_act("s1", PERSON, "accept-reads", ["tool:demo/add"], {}, confirmed=True,
+                                base_revision=seen["revision"]))
     assert again["status"] == "done"
     assert mind(hive, "s1", "read-tool", "r4", server="demo", tool="add", arguments={"a": 1, "b": 1})["status"] == "done"
 
@@ -395,7 +398,7 @@ def test_accepting_reads_needs_the_page_the_person_saw(hive, restartable_demo):
     hive.program.ENGINE.forget("s1", "demo")  # the session ends, as on a dropped connection; nothing is traced
     mind(hive, "s1", "list-tools", "k1", server="demo")  # a new session loads the changed definition
     stale = run(hive.person_act("s1", PERSON, "accept-reads", ["server:demo"],
-                                {"base_revision": seen["revision"]}, confirmed=True))
+                                {}, confirmed=True, base_revision=seen["revision"]))
     assert stale["status"] == "stale" and "Add two integers and keep a copy" in text_of(stale["graph"], "tool:demo/add")
     assert mind(hive, "s1", "read-tool", "k2", server="demo", tool="add",
                 arguments={"a": 1, "b": 1})["detail"]["review"] == "not reviewed"
@@ -487,8 +490,8 @@ def test_remove_server(hive, demo_url):
 
 def test_stale_page_is_refused(hive, demo_url):
     add(hive, "s1", "demo", demo_url)
-    result = run(hive.person_act("s1", PERSON, "remove-server", ["server:demo"],
-                                 {"base_revision": "r-old"}, confirmed=True))
+    result = run(hive.person_act("s1", PERSON, "remove-server", ["server:demo"], {}, confirmed=True,
+                                 base_revision="r-old"))
     assert result["status"] == "stale"
     validate_graph(result["graph"])
 
