@@ -85,6 +85,14 @@ class Processes:
         self.args = args
 
     def __enter__(self):
+        try:
+            self._start()
+        except BaseException:  # a process that did start is stopped, whatever stopped the others
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def _start(self) -> None:
         teams_log, hive_log = self.work / "teams-mcp.log", self.work / "hive.log"
         teams = subprocess.Popen([str(self.args.hive_python), str(self.args.teams_server),
                                   "--port", str(self.teams_port)], env=self.env, cwd=str(ROOT),
@@ -99,7 +107,6 @@ class Processes:
         # /api/health needs a session (401 without one), so any answer below 500 means the hive is serving.
         wait_until(hive, lambda: httpx.get(f"{self.base}/api/health", timeout=5).status_code < 500, "the hive",
                    hive_log)
-        return self
 
     def __exit__(self, *exc):
         for proc in reversed(self.procs):
