@@ -31,7 +31,7 @@ opens around 19–20 November.
 | `add-server`, `remove-server` | no | confirm | People only |
 | `accept-reads` | no | confirm | Accept the tools a server marks read-only as reads: a whole server, or one tool |
 | `reclass-tool` | no | confirm | Make a tool `write` or `hidden`, or back to `default` (never `read`) |
-| `connect`, `revoke` | no | confirm | OAuth device-code sign-in inside the app, and its removal |
+| `connect`, `revoke` | no | confirm | OAuth sign-in inside the app (device code, or browser with PKCE), and its removal |
 
 Parameters for the tool actions: `server`, `tool`, `arguments` (a JSON object,
 or a string holding one). They are also `binding_params`, so an approval binds
@@ -163,7 +163,19 @@ signed in) and `offline_access` (so the token can be renewed) to the scopes.
 `connect` returns a code and a sign-in address to the person who ran it, and
 only to them: the view never shows the code, so nobody else in the swarm can
 finish that sign-in with their own account. The app finishes the sign-in on
-its own once the person has signed in. The view then shows the account that
+its own once the person has signed in.
+
+Tenants created since July 2026 block the device code while Microsoft's
+security defaults are on. There, run `connect` with `{"flow": "browser"}`:
+the result gives the person an address to open (authorization code with
+PKCE). After they sign in, the browser lands on
+`https://login.microsoftonline.com/common/oauth2/nativeclient?code=...`, an
+empty page. They run `connect` again with that whole address as
+`redirect_url`, within ten minutes, and only they can finish it. The app
+registration needs that address as a redirect URI under *Mobile and desktop
+applications*.
+
+Either way, the view then shows the account that
 signed in (`preferred_username` from the id_token, kept only to show it; the
 id_token itself is not stored), which is the account every mind in the swarm
 acts as on that server. `revoke` deletes the token.
@@ -218,7 +230,7 @@ Behaviour that changes for a hive that ran 0.1.0:
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 56 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 58 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
@@ -249,7 +261,7 @@ Coverage against the brief's definition of done:
 | A write-classed tool refused through `read-tool` | `test_read_tool_refuses_a_write_classed_tool` |
 | `use-tool` waiting for approval | `test_use_tool_waits_for_a_person` |
 | An identical retry returning the recorded result | `test_identical_retry_returns_the_recorded_result`, `test_app_level_idempotency_also_holds` |
-| Tokens never in results, views or logs | `test_tokens_never_appear_in_results_views_traces_or_logs`, `test_device_code_sign_in_and_revoke` |
+| Tokens never in results, views or logs | `test_tokens_never_appear_in_results_views_traces_or_logs`, `test_device_code_sign_in_and_revoke`, `test_browser_sign_in_with_pkce` |
 | `programs_check` passes | COMPATIBLE with the pre-release copy: `cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-connect`. It sees only an empty view, so `test_contract.py` checks fuller views and every result with the hive's validators |
 | Live demo: read a Teams channel, then a write a person approves | run on a real tenant with `examples/teams-mcp/demo.py`, in the repository's fake hive (13 Nov 2026: the channel read, a message posted once approved); on a scratch hive still to do. `test_demo.py` and the last test of `test_server.py` rehearse it offline |
 
@@ -264,6 +276,7 @@ Coverage of the first review's changes:
 | `accept-reads` applies to the definitions the person saw | `test_accepting_reads_needs_the_page_the_person_saw` |
 | A call goes out only on the definition it was classed by | `test_a_call_goes_out_only_on_the_definition_it_was_checked_against` (engine) |
 | The device code only in the `connect` result; the view shows the account that signed in | `test_device_code_sign_in_and_revoke` |
+| Browser sign-in with PKCE for tenants that block the device code; only its own address and person finish it | `test_browser_sign_in_with_pkce`, `test_a_browser_sign_in_finishes_only_with_its_own_address_for_its_own_person` |
 | Token renewal: off the event loop, once at a time per server, never over a revoke | `test_a_token_renewal_does_not_block_the_event_loop`, `test_calls_on_several_loops_renew_the_token_once`, `test_a_renewal_that_ends_after_a_revoke_does_not_bring_the_token_back` |
 | A renewed token opens a new session; the call running on the old one finishes | `test_a_renewed_token_opens_a_new_session`, `test_a_call_running_when_the_token_is_renewed_finishes_on_its_session` |
 

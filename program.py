@@ -597,7 +597,8 @@ async def act(ctx, action, items, params):
                                graph=view(ctx, None, "unfold"))
             handler = {"add-server": _add_server, "remove-server": _remove_server, "accept-reads": _accept_reads,
                        "reclass-tool": _reclass_tool, "connect": _connect, "revoke": _revoke}[action]
-            return handler(ctx, swarm, store, items, params)
+            result = handler(ctx, swarm, store, items, params)
+            return await result if asyncio.iscoroutine(result) else result
         return _refused(f"unknown action '{action}'")
     except (engine_mod.EngineError, store_mod.StoreError, oauth_mod.OAuthError) as exc:
         return _result("error", exc.message, detail={"type": exc.kind})
@@ -903,15 +904,31 @@ def _reclass_tool(ctx, swarm, store, items, params):
     return _result("done", f"'{tool}' is now {cls}")
 
 
-def _connect(ctx, swarm, store, items, params):
+async def _connect(ctx, swarm, store, items, params):
     record, _ = _target(store, items, params, need_tool=False)
     auth = record.get("auth") or {}
     if auth.get("kind") != "oauth-device":
         return _refused("this server has no sign-in; nothing to connect")
     store_mod._fernet()  # fail now, not after the person signs in, if tokens cannot be stored
-    code = oauth_mod.start_device_flow(auth["tenant"], auth["client_id"], auth["scopes"])
     key = (swarm, record["name"])
     person = _actor(ctx)
+    if params.get("redirect_url") is not None:
+        return await _finish_browser_signin(swarm, store, record, person, str(params["redirect_url"]))
+    flow = params.get("flow", "device")
+    if flow == "browser":
+        signin = oauth_mod.start_browser_flow(auth["tenant"], auth["client_id"], auth["scopes"])
+        with _SIGNIN_LOCK:
+            _PENDING_SIGNINS[key] = {"by": person, "browser": signin}  # the address goes only to this person
+        return _result("needs_input",
+                       f"Open {signin.url} and sign in. Your browser then lands on an address starting with "
+                       f"{signin.redirect_uri} (the page stays empty). Run connect again with that whole address "
+                       f"as redirect_url, within {oauth_mod.BROWSER_SIGNIN_SECONDS // 60} minutes.",
+                       needs={"redirect_url": "the whole address your browser lands on after you sign in"},
+                       detail={"authorization_url": signin.url, "redirect_uri": signin.redirect_uri,
+                               "expires_in": oauth_mod.BROWSER_SIGNIN_SECONDS})
+    if flow != "device":
+        return _refused("flow must be device (a code to enter) or browser (an address to paste back)")
+    code = oauth_mod.start_device_flow(auth["tenant"], auth["client_id"], auth["scopes"])
     pending = {"by": person}  # the code goes only to this person, in the result below
     with _SIGNIN_LOCK:
         _PENDING_SIGNINS[key] = pending
@@ -939,6 +956,41 @@ def _connect(ctx, swarm, store, items, params):
                            "The connection completes on its own once you have.",
                    detail={"verification_uri": code.verification_uri, "user_code": code.user_code,
                            "expires_in": int(code.expires_at - time.time())})
+
+
+async def _finish_browser_signin(swarm, store, record, person, landed):
+    """The person pastes the address their browser landed on. A wrong or failed paste leaves the sign-in
+    open until it expires, so they can sign in again from the same address and paste the new one."""
+    key = (swarm, record["name"])
+    with _SIGNIN_LOCK:
+        pending = _PENDING_SIGNINS.get(key)
+    signin = (pending or {}).get("browser")
+    if signin is None or pending["by"] != person:
+        return _refused("no browser sign-in of yours is waiting for this server; run connect with flow browser first")
+    if time.time() > signin.expires_at:
+        with _SIGNIN_LOCK:
+            if _PENDING_SIGNINS.get(key) is pending:
+                _PENDING_SIGNINS.pop(key)
+        return _refused("that sign-in expired; run connect with flow browser again")
+    auth = record["auth"]
+    # The identity provider is called in a thread, so the hive's event loop keeps running.
+    try:
+        token = await asyncio.to_thread(oauth_mod.finish_browser_flow, auth["tenant"], auth["client_id"],
+                                        auth["scopes"], signin, landed)
+    except oauth_mod.OAuthError as exc:
+        store.trace({"action": "connect", "server": record["name"], "tool": None, "actor": person,
+                     "status": "error", "reason": exc.message[:200]})
+        raise
+    token["person"] = person
+    # As for the device code: close the old session before the new token is visible.
+    ENGINE.forget(swarm, record["name"])
+    store.put_credentials(record["name"], token)
+    with _SIGNIN_LOCK:
+        if _PENDING_SIGNINS.get(key) is pending:
+            _PENDING_SIGNINS.pop(key)
+    store.trace({"action": "connect", "server": record["name"], "tool": None, "actor": person, "status": "done"})
+    account = engine_mod.clean_text(token.get("account"), 120)
+    return _result("done", f"signed in to '{record['name']}'" + (f" as {account}" if account else ""))
 
 
 def _revoke(ctx, swarm, store, items, params):
