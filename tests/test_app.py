@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from conftest import ACCOUNT, AUTH_CODE, DEMO, NEW_TOKEN, REFRESH, SECRET
-from fakehive import FakeHive, HostRefusal, mind_actor, run, validate_graph
+from fakehive import Ctx, FakeHive, HostRefusal, mind_actor, run, validate_graph
 
 PERSON = "ada"   # the hive's ids carry no kind; ctx.actor says the kind
 MIND = "scout"
@@ -95,13 +95,42 @@ def origin(url):
     return f"{urlsplit(url).scheme}://{urlsplit(url).netloc}"
 
 
-@pytest.fixture
-def hive(program):
+def attached(program):
+    """A fake hive where the mind may list and read, and use-tool asks a person."""
     h = FakeHive(program)
     for action in ("list-servers", "list-tools", "inspect-tool", "read-tool"):
         h.attach(MIND, action, "allow")
     h.attach(MIND, "use-tool", "ask")
     return h
+
+
+def calls_to_act(program, monkeypatch):
+    """Every act() the hive makes from here on, by action."""
+    calls, act = [], program.act
+
+    async def recorded(ctx, action, items, params):
+        calls.append(action)
+        return await act(ctx, action, items, params)
+
+    monkeypatch.setattr(program, "act", recorded)
+    return calls
+
+
+def tool_calls(program, monkeypatch):
+    """The tool of every call that the app hands to the engine from here on."""
+    calls, call = [], program.ENGINE.call
+
+    async def counted(swarm, spec, tool, *args, **kwargs):
+        calls.append(tool)
+        return await call(swarm, spec, tool, *args, **kwargs)
+
+    monkeypatch.setattr(program.ENGINE, "call", counted)
+    return calls
+
+
+@pytest.fixture
+def hive(program):
+    return attached(program)
 
 
 # ------------------------------------------------------------------ describe
@@ -173,24 +202,40 @@ def test_use_tool_waits_for_a_person(hive, demo_url):
     assert traced["approved_by"] == f"user:{PERSON}" and traced["approval_id"] == first["approval_id"]
 
 
-def test_identical_retry_returns_the_recorded_result(hive, demo_url):
+def test_identical_retry_returns_the_recorded_result(hive, demo_url, monkeypatch):
+    """use-tool declares no revalidate, so the hive answers an identical retry of a write it recorded as
+    done from its own record, without calling the app or asking a person again."""
     add(hive, "s1", "demo", demo_url)
     review(hive, "s1", "demo")
     args = {"title": "once", "text": "1"}
     first = write(hive, "s1", "w1", server="demo", tool="create_note", arguments=args)
     write(hive, "s1", "w-del", server="demo", tool="delete_notes", arguments={})
+    calls = calls_to_act(hive.program, monkeypatch)
     retry = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
-    assert retry == first  # recorded, not re-run: the note stays deleted
+    assert retry == first and calls == [] and hive.pending() == []  # recorded, not re-run
     assert "once" not in mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"]
     with pytest.raises(HostRefusal) as conflict:
         mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments={"title": "other", "text": "2"})
     assert conflict.value.status == 409
 
 
-def test_an_identical_retry_is_a_recovery_that_runs_nothing_again(hive, demo_url, monkeypatch):
-    """The hive delivers an identical retry of a write it recorded as done as a recovery: act() gets
-    the approval the write first ran under and ctx.actor.recovery. The app answers from its own record;
-    once it no longer keeps that record, it still runs nothing, and says so."""
+def test_a_recovery_answers_from_the_apps_record_or_the_hives(program, demo_url, monkeypatch):
+    """The hive delivers a recovery only for an action that declares revalidate: true, which use-tool does
+    not; here it does, so the fake host delivers one. act() gets the approval the write first ran under,
+    ctx.actor.recovery and the hive's record of the answer (ctx.command.recorded_result). The app answers
+    from its own record, or, once it no longer keeps that, with the hive's; with neither it refuses. The
+    write never runs again."""
+    describe = program.describe
+
+    def revalidating():
+        described = describe()
+        for action in described["actions"]:
+            if action["id"] == "use-tool":
+                action["revalidate"] = True
+        return described
+
+    monkeypatch.setattr(program, "describe", revalidating)
+    hive = attached(program)
     add(hive, "s1", "demo", demo_url)
     review(hive, "s1", "demo")
     note = {"server": "demo", "tool": "create_note", "arguments": {"title": "once", "text": "1"}}
@@ -198,28 +243,33 @@ def test_an_identical_retry_is_a_recovery_that_runs_nothing_again(hive, demo_url
     first = mind(hive, "s1", "use-tool", "w1", approval_id, **note)
     assert first["status"] == "done"
     run(hive.person_act("s1", PERSON, "use-tool", [], {"server": "demo", "tool": "delete_notes", "arguments": {}}))
-    actors, act = [], hive.program.act
+    actors, act = [], program.act
 
     async def recorded(ctx, action, items, params):
-        actors.append(dict(ctx.actor))
+        actors.append((dict(ctx.actor), dict(ctx.command)))
         return await act(ctx, action, items, params)
 
-    monkeypatch.setattr(hive.program, "act", recorded)
+    monkeypatch.setattr(program, "act", recorded)
+    sent = tool_calls(program, monkeypatch)
     assert mind(hive, "s1", "use-tool", "w1", **note) == first  # no new approval is asked for
-    assert actors[-1]["recovery"] is True and actors[-1]["approval"]["id"] == approval_id
-    store = hive.program.store_mod.SwarmStore("s1")
+    actor, command = actors[-1]
+    assert actor["recovery"] is True and actor["approval"]["id"] == approval_id
+    assert command["recorded_result"] == first and command["revalidation_supported"] is True
+    store = program.store_mod.SwarmStore("s1")
     store.drop_intent("w1")  # the app no longer keeps the answer
-    again = mind(hive, "s1", "use-tool", "w1", **note)
+    assert mind(hive, "s1", "use-tool", "w1", **note) == first  # the hive's record of it
+    assert sent == []
+    ctx = Ctx(swarm_id="s1", actor={**mind_actor("s1", MIND, APPROVED), "recovery": True},
+              command={"idempotency_key": "w1", "record_id": command["record_id"], "recorded_result": None})
+    again = run(program.act(ctx, "use-tool", [], note))  # neither record
     assert again["status"] == "refused" and again["detail"]["type"] == "recovery"
     assert store.traces(1)[0]["reason"] == "recovery-without-record"
     notes = mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"]
-    assert notes == "(no notes)"  # neither retry wrote the note again
+    assert notes == "(no notes)" and sent == ["list_notes"]  # no recovery wrote the note again
 
 
 def test_app_level_idempotency_also_holds(program, demo_url):
     """Defence in depth: the app keeps its own intent records for use-tool."""
-    from fakehive import Ctx
-
     hive = FakeHive(program)
     add(hive, "s1", "demo", demo_url)
     ctx = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND, APPROVED), command={"idempotency_key": "same"})
@@ -273,8 +323,6 @@ def test_a_write_delivered_again_after_a_failure_warns_it_may_repeat(hive, demo_
 def test_a_write_that_never_went_out_is_not_reported_as_unknown(program, demo_url, monkeypatch):
     """A call the engine never sends (its tool changed twice while being checked) leaves no record,
     so the next delivery runs it with no warning."""
-    from fakehive import Ctx
-
     hive = FakeHive(program)
     add(hive, "s1", "demo", demo_url)
     ctx = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND, APPROVED), command={"idempotency_key": "w1"})
@@ -351,7 +399,7 @@ def test_a_new_servers_tools_stay_write_until_a_person_accepts_its_reads(hive, d
 
     with pytest.raises(HostRefusal) as by_a_mind:
         run(hive.agent_act("s1", MIND, "accept-reads", {"server": "demo"}, "k3"))
-    assert by_a_mind.value.code == "not_for_agents"
+    assert by_a_mind.value.code == "not_for_minds"
     with pytest.raises(HostRefusal) as unconfirmed:
         run(hive.person_act("s1", PERSON, "accept-reads", ["server:demo"], {}))
     assert unconfirmed.value.code == "confirm_required"
@@ -512,7 +560,7 @@ def test_no_rule_means_deny(program, demo_url):
     add(hive, "s1", "demo", demo_url)
     with pytest.raises(HostRefusal) as denied:
         mind(hive, "s1", "read-tool", "k1", server="demo", tool="add", arguments={"a": 1, "b": 1})
-    assert denied.value.code == "policy_denied"
+    assert denied.value.code == "policy_refused"
 
 
 def test_stdio_is_off_by_default(hive, monkeypatch):
@@ -558,10 +606,19 @@ def test_url_rules(hive):
     assert add(hive, "s1", "d", "https://example.com/mcp")["status"] == "done"
 
 
-def test_credential_keys_in_a_body_are_refused_by_the_host(hive, demo_url):
+def test_credential_keys_in_a_request_are_refused_by_the_host(hive, demo_url):
+    """The host refuses a request whose params carry a credential-like or identity key at the top level,
+    which is why add-server takes signin. It does not look inside signin: there the app takes only the
+    fields it knows, and a token is not one of them."""
     with pytest.raises(HostRefusal) as refused:
-        add(hive, "s1", "x", demo_url, signin={"kind": "bearer-env", "token": "abc"})
-    assert refused.value.code == "credential_in_body"
+        add(hive, "s1", "x", demo_url, token="abc")
+    assert refused.value.code == "credential_in_request"
+    with pytest.raises(HostRefusal) as named:
+        add(hive, "s1", "x", demo_url, principal="user:eve")
+    assert named.value.code == "identity_in_request"
+    nested = add(hive, "s1", "x", demo_url, signin={"kind": "bearer-env", "token": "abc"})
+    assert nested["status"] == "refused" and "OMEGA_CONNECT_CRED_" in nested["message"]
+    assert mind(hive, "s1", "list-servers", "k1")["detail"]["servers"] == []
 
 
 def test_swarms_are_isolated(hive, demo_url):
@@ -849,8 +906,6 @@ def test_a_browser_sign_in_finishes_only_with_its_own_address_for_its_own_person
                                                                              "server:m365")
     landed = fake_authority.authorize(started["detail"]["authorization_url"])
     assert connect("eve", redirect_url=landed)["status"] == "refused"  # another person's sign-in
-    from fakehive import Ctx
-
     as_mind = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND))  # the host offers connect to people only
     assert run(hive.program.act(as_mind, "connect", ["server:m365"], {"redirect_url": landed}))["status"] == "refused"
     elsewhere = connect(PERSON, redirect_url=landed.replace("/common/oauth2/nativeclient", "/elsewhere"))

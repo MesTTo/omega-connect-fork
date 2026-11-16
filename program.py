@@ -154,11 +154,10 @@ def _actor(ctx) -> str:
 
 
 def _command(ctx, name: str) -> Any:
-    """A field of ctx.command, the request identity the hive sets for act():
-    idempotency_key and record_id. The person route also sets prior_failed when
-    it delivers again an attempt that failed (PROGRAMS.md 9d); the agent route
-    delivers a mind's failed attempt again with the same record_id and no
-    prior_failed."""
+    """A field of ctx.command, the request identity the hive sets for act(): idempotency_key and
+    record_id, and in a recovery recorded_result. The hive delivers a mind's failed attempt again,
+    after a new approval, with the same record_id; it sets prior_failed only for actions that declare
+    person_activity, which omega-connect's do not."""
     command = getattr(ctx, "command", None)
     return command.get(name) if isinstance(command, dict) else getattr(command, name, None)
 
@@ -178,8 +177,10 @@ def _actor_kind(ctx) -> str | None:
 
 def _recovery(ctx) -> bool:
     """ctx.actor.recovery: the hive delivers again an act it already recorded as done, with the
-    approval it first ran under, only so the caller hears its answer again; nothing is to be done
-    twice (PROGRAMS.md 9d for people; the agent route does the same for an identical retry)."""
+    approval it first ran under and its record of the answer (ctx.command.recorded_result), only so
+    the caller hears that answer again; nothing is to be done twice. The hive does so only for
+    actions that declare revalidate: true. use-tool does not, so the hive itself answers an
+    identical retry of a write it recorded as done."""
     actor = getattr(ctx, "actor", None)
     return bool(actor.get("recovery") if isinstance(actor, dict) else getattr(actor, "recovery", False))
 
@@ -684,12 +685,27 @@ async def _inspect_tool(swarm, store, items, params):
 _PRIOR_FAILED = "An earlier attempt at this request failed with an unknown outcome and may already have taken effect."
 
 
+def _recovered(ctx, store, trace: dict) -> dict:
+    """A recovery that the app's own record could not answer: the hive's record of the answer,
+    ctx.command.recorded_result, answers instead. The write is never sent twice."""
+    recorded = _command(ctx, "recorded_result")
+    if isinstance(recorded, dict) and recorded.get("status"):
+        return recorded
+    store.trace({**trace, "status": "refused", "reason": "recovery-without-record"})
+    return _refused("this request was already carried out and its answer is no longer kept; it is not run "
+                    "twice, and a new request runs it again", detail={"type": "recovery"})
+
+
 async def _call_tool(ctx, swarm, store, action, items, params):
     record, tool = _target(store, items, params, need_tool=True)
     try:
         arguments = _parse_arguments(params.get("arguments"))
     except ValueError as exc:
         return _refused(str(exc))
+    approval = _approval(ctx)
+    trace = {"action": action, "server": record["name"], "tool": tool, "actor": _actor(ctx),
+             "approved_by": approval.get("approved_by"), "approval_id": approval.get("id"),
+             "record_id": _command(ctx, "record_id"), "arguments_digest": store_mod.digest(arguments)}
     request_digest = store_mod.digest({"action": action, "server": record["name"], "tool": tool,
                                        "arguments": arguments})
     intent = _intent_key(ctx, params) if action == "use-tool" else None
@@ -702,16 +718,18 @@ async def _call_tool(ctx, swarm, store, action, items, params):
                 return _refused("this idempotency key was used for a different request", detail={"type": "conflict"})
             if earlier.get("result") is not None:
                 return earlier["result"]
+    if action == "use-tool" and _recovery(ctx):
+        return _recovered(ctx, store, trace)
     # An attempt that went out and kept no result left only this record, written just before the
     # call (below). The agent route sends no prior_failed, so the record is how a mind's write
-    # delivered again is known. A recovery is not such a delivery: the hive recorded the act as done.
-    unknown = not _recovery(ctx) and (bool(earlier) or bool(_command(ctx, "prior_failed")))
+    # delivered again is known.
+    unknown = bool(earlier) or bool(_command(ctx, "prior_failed"))
 
     def sending():
         if intent:
             store.put_intent(intent, {"request": request_digest, "result": None, "at": time.time()})
 
-    result, attempted = await _run_tool(ctx, swarm, store, action, record, tool, arguments, sending)
+    result, attempted = await _run_tool(ctx, swarm, store, action, record, tool, arguments, trace, sending)
     if action == "use-tool" and unknown:
         result = {**result, "message": f"{_PRIOR_FAILED} {result['message']}".strip(),
                   "detail": {**(result.get("detail") or {}), "prior_failed": True}}
@@ -722,22 +740,12 @@ async def _call_tool(ctx, swarm, store, action, items, params):
     return result
 
 
-async def _run_tool(ctx, swarm, store, action, record, tool, arguments, sending=lambda: None):
+async def _run_tool(ctx, swarm, store, action, record, tool, arguments, trace, sending=lambda: None):
     """Connect, check the tool's class, call it and trace. Returns (result, attempted):
     attempted is False when the call never went out, so a retry may still run it.
     sending() runs just before each call goes out."""
     secrets = _secrets_for(store, record)
     approval = _approval(ctx)
-    trace = {"action": action, "server": record["name"], "tool": tool, "actor": _actor(ctx),
-             "approved_by": approval.get("approved_by"), "approval_id": approval.get("id"),
-             "record_id": _command(ctx, "record_id"), "arguments_digest": store_mod.digest(arguments)}
-    if action == "use-tool" and _recovery(ctx):
-        # A recovery reaches this point only when the app no longer keeps the act's answer
-        # (_call_tool returns it otherwise). The write may have gone out the first time, so it does
-        # not go out again.
-        store.trace({**trace, "status": "refused", "reason": "recovery-without-record"})
-        return _refused("this request was already carried out and its answer is no longer kept here; it is "
-                        "not run twice, and a new request runs it again", detail={"type": "recovery"}), False
     if action == "use-tool" and _actor_kind(ctx) == "mind" and not approval:
         # The brief: every write is approved by a person. A mind's rule can still say "allow", for
         # instance a pattern the owner wrote for its reads that also matches use-tool, so the app
