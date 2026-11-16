@@ -59,8 +59,8 @@ get its own Graph token (on-behalf-of flow).
    `OMEGA_CONNECT_SECRET_KEY` set, and a mind attached with `list-tools` and
    `read-tool` on *allow* and `use-tool` on *ask*. Do the person's steps as a
    named person signed in to the hive, not with the local operator password:
-   `use-tool` declares `approver: "person"`, so with the operator password
-   nobody can run or approve a write.
+   `connect` and `use-tool` declare `approver: "person"`, so with the operator
+   password nobody can sign in, or run or approve a write.
 
 ## Demo steps
 
@@ -91,8 +91,9 @@ the tenant account and accept the permissions. The app finishes the sign-in by
 itself; the view then shows
 `Sign-in: oauth-device (signed in by <principal>, as <the account>; minds use this sign-in)`.
 A mind uses the sign-in of the person it belongs to; until the hive names that
-person (omegahive #332), it uses a server's sign-in only while one person alone
-is signed in to it, so sign in to `teams` as the only person.
+person (omegahive #332), it uses a sign-in only while one person alone is
+signed in to the swarm's servers, so do the demo in a swarm where nobody else
+has signed in to a server.
 
 On a tenant whose security defaults block the device code, run connect with
 `{"flow": "browser"}` instead. Open the address in the result, sign in and

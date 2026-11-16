@@ -145,7 +145,10 @@ def describe():
              "applies_to": ["server", "tool"], "confirm": True},
             {"id": "reclass-tool", "label": "Reclass tool (write, hidden or default)", "applies_to": ["tool"],
              "confirm": True},
-            {"id": "connect", "label": "Sign in to this server", "applies_to": ["server"], "confirm": True},
+            # approver "person" here too: a sign-in always belongs to a named person, so the hive refuses
+            # connect to the local operator password (403 person_required).
+            {"id": "connect", "label": "Sign in to this server", "applies_to": ["server"], "confirm": True,
+             "approver": "person"},
             {"id": "revoke", "label": "Revoke sign-in", "applies_to": ["server"], "confirm": True},
         ],
     }
@@ -260,11 +263,20 @@ class _NoSignin(engine_mod.EngineError):
     """No sign-in this caller may use: the act is refused rather than failed."""
 
 
+def _signed_in(store, servers: dict) -> dict[str, dict[str, dict]]:
+    """The sign-ins to each oauth-device server of the swarm: {server: {principal: sign-in}}."""
+    kept = store.all_signins()
+    return {name: kept.get(name, {}) for name, record in servers.items()
+            if (record.get("auth") or {}).get("kind") == "oauth-device"}
+
+
 def _signin_owner(ctx, store, record: dict) -> str | None:
     """Whose sign-in a call to an oauth-device server uses, by principal: a person's own; for a mind,
     the sign-in of the person it belongs to (_mind_owner), and while the hive does not say who that
-    is, the sign-in of the one person signed in to the server. Never anyone else's: with no such
-    sign-in, _NoSignin. None for the other kinds of server."""
+    is, the sign-in of the one person signed in to the swarm's servers, all its oauth-device servers
+    counted together: with two people signed in, each to a server of their own, the mind could be
+    either's. Never anyone else's: with no such sign-in, _NoSignin. None for the other kinds of
+    server."""
     if (record.get("auth") or {}).get("kind") != "oauth-device":
         return None
     name = record["name"]
@@ -279,15 +291,16 @@ def _signin_owner(ctx, store, record: dict) -> str | None:
             raise _NoSignin("owner_not_signed_in", f"{owner}, whose mind this is, has not signed in to '{name}'; "
                                                    "they run connect, and the mind uses no one else's sign-in")
         return owner
-    people = sorted(store.signins(name))
-    if len(people) == 1:
-        return people[0]
-    if not people:
+    signins = _signed_in(store, store.servers())
+    if not signins.get(name):
         raise _NoSignin("not_signed_in", f"nobody has signed in to '{name}'; a person runs connect to sign in")
-    raise _NoSignin("owner_unknown", f"{len(people)} people have signed in to '{name}'. A mind uses only the "
-                                     "sign-in of the person it belongs to, and the hive does not say who that is "
-                                     "yet (omegahive #332), so this mind uses none of them; minds use a sign-in "
-                                     "while it is the only one")
+    people = {person for on_server in signins.values() for person in on_server}
+    if len(people) == 1:
+        return people.pop()  # signed in to this server, since somebody is
+    raise _NoSignin("owner_unknown", f"{len(people)} people have signed in to servers of this swarm. A mind uses "
+                                     "only the sign-in of the person it belongs to, and the hive does not say who "
+                                     "that is yet (omegahive #332), so this mind uses none of them; minds use a "
+                                     "sign-in while only one person is signed in to the swarm's servers")
 
 
 async def _spec(swarm: str, store, record: dict, owner: str | None) -> Any:
@@ -508,31 +521,42 @@ def _error_text(exc: BaseException, secrets: tuple[str, ...]) -> str:
 
 # =================================================================== view
 
-def _signin_text(swarm: str, store, name: str, record: dict) -> str:
-    """A server's sign-in line in the view: who signed in, and the account minds use while one person
-    alone is signed in (_signin_owner); never a code or a token. The code of a sign-in in progress
-    goes only to the person who ran connect."""
-    kind = (record.get("auth") or {}).get("kind", "none")
-    if kind != "oauth-device":
-        return f"Sign-in: {kind}"
+def _signin_texts(swarm: str, store, servers: dict) -> dict[str, str]:
+    """Each server's sign-in line in the view: who signed in, and whether minds use that sign-in, as
+    they do while one person alone is signed in to the swarm's servers (_signin_owner); never a code
+    or a token. The code of a sign-in in progress goes only to the person who ran connect."""
     try:
-        people = store.signins(name)
+        signins = _signed_in(store, servers)
     except store_mod.StoreError:
-        people = {}
-    if not people:
-        state = "not signed in"
-    elif len(people) == 1:
-        [(person, token)] = people.items()
-        account = engine_mod.clean_text(token.get("account"), 120)
-        state = f"signed in by {person}" + (f", as {account}" if account else "") + "; minds use this sign-in"
-    else:
-        state = (f"{len(people)} people signed in ({', '.join(sorted(people))}); minds use none of them until "
-                 "the hive says whose each mind is")
+        signins = {}
+    everyone = {person for on_server in signins.values() for person in on_server}
     with _SIGNIN_LOCK:  # sign-in threads add and drop entries
-        started = sorted(by for (s, n, by) in _PENDING_SIGNINS if (s, n) == (swarm, name))
-    if started:
-        state += f"; a sign-in started by {', '.join(started)} is in progress"
-    return f"Sign-in: oauth-device ({state})"
+        pending = sorted((n, by) for (s, n, by) in _PENDING_SIGNINS if s == swarm)
+    texts = {}
+    for name, record in servers.items():
+        kind = (record.get("auth") or {}).get("kind", "none")
+        if kind != "oauth-device":
+            texts[name] = f"Sign-in: {kind}"
+            continue
+        people = signins.get(name, {})
+        if not people:
+            state = "not signed in"
+        elif len(people) == 1:
+            [(person, token)] = people.items()
+            account = engine_mod.clean_text(token.get("account"), 120)
+            others = sorted(everyone - {person})  # signed in to other servers of the swarm
+            state = f"signed in by {person}" + (f", as {account}" if account else "") + (
+                "; minds do not use it while other people are signed in to this swarm's servers "
+                f"({', '.join(others)}) and the hive does not say whose each mind is" if others
+                else "; minds use this sign-in")
+        else:
+            state = (f"{len(people)} people signed in ({', '.join(sorted(people))}); minds use none of them until "
+                     "the hive says whose each mind is")
+        started = [by for (n, by) in pending if n == name]
+        if started:
+            state += f"; a sign-in started by {', '.join(started)} is in progress"
+        texts[name] = f"Sign-in: oauth-device ({state})"
+    return texts
 
 
 def _class_note(record: dict, tool, review: str | None) -> str:
@@ -555,7 +579,7 @@ def _revision(swarm: str, store) -> str:
         "tools": {name: {t.name: t.digest for t in ENGINE.peek(swarm, name).tools.values()}
                   if ENGINE.peek(swarm, name) else {} for name in servers},
         "connected": {name: _server_status(swarm, rec)["status"] for name, rec in servers.items()},
-        "signin": {name: _signin_text(swarm, store, name, rec) for name, rec in servers.items()},
+        "signin": _signin_texts(swarm, store, servers),
         "calls": store.trace_mark(),
     }
     return "r-" + store_mod.digest(state)[7:23]
@@ -590,11 +614,12 @@ def view(ctx, focus, stage):
     shares = _fair_shares({name: len(tools) for name, tools in loaded.items()},
                           MAX_ITEMS_IN_VIEW - len(shown) - len(traces))
     left_out = {name: (shares[name], len(tools)) for name, tools in loaded.items() if shares[name] < len(tools)}
+    signin = _signin_texts(swarm, store, servers)
     for name, record in shown:
         status = _server_status(swarm, record)
         lines = [f"Transport: {record.get('transport', 'http')}",
                  f"Address: {_safe_url(record.get('url')) or record.get('command', '')}",
-                 _signin_text(swarm, store, name, record),
+                 signin[name],
                  f"Status: {status['status']}"]
         if name in left_out:
             shown_count, total = left_out[name]

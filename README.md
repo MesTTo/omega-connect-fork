@@ -32,7 +32,7 @@ against `hive/core/program_actions.py` from omegahive main (832b36e).
 | `add-server`, `remove-server` | no | confirm | People only |
 | `accept-reads` | no | confirm | Accept the tools a server marks read-only as reads: a whole server, or one tool |
 | `reclass-tool` | no | confirm | Make a tool `write` or `hidden`, or back to `default` (never `read`) |
-| `connect`, `revoke` | no | confirm | OAuth sign-in inside the app (device code, or browser with PKCE), and its removal |
+| `connect`, `revoke` | no | confirm | OAuth sign-in inside the app (device code, or browser with PKCE), for a named person only, and its removal |
 
 Parameters for the tool actions: `server`, `tool`, `arguments` (a JSON object,
 or a string holding one). They are also `binding_params`, so an approval binds
@@ -168,7 +168,9 @@ the hive runs a write or approves a mind's, and the hive refuses the local
 operator password for both (403 `person_required` when it runs `use-tool`,
 409 `person_approval_required` when it approves). With only the operator
 password, nobody can run or approve a write, so the demo on a scratch hive
-is done as a named person.
+is done as a named person. `connect` declares `approver: "person"` too: a
+sign-in always belongs to a named person, so the hive refuses `connect` to
+the local operator password (403 `person_required`).
 
 ## Add a server (person, confirmed)
 
@@ -216,16 +218,20 @@ and a person's own calls to the server use their own. One who has not signed
 in is told to run `connect`. A mind uses the sign-in of the person it belongs
 to, never anyone else's (open point 4). The hive does not say who that is yet
 (asked for in omegahive #332; `_mind_owner` in `program.py` is the one place
-that will read it), so until it does, a mind uses a server's sign-in only
-while one person alone is signed in to it. With nobody signed in, or several
-people, a mind's act on that server is refused, saying why (`detail.type`
-`not_signed_in` or `owner_unknown`); once the hive names owners, a mind whose
-owner has not signed in is refused (`owner_not_signed_in`) rather than given
-someone else's token. A mind's write runs as that person's account, so only
-they can approve it: the approver the hive names (`approved_by`) must be
-them. The view lists who signed in and the account minds use
+that will read it), so until it does, a mind uses a sign-in only while one
+person alone is signed in to the swarm's servers, all its `oauth-device`
+servers counted together. With ada signed in only to `notes` and bob only to
+`notes2`, the mind could be either's, so its acts are refused on both
+(`detail.type` `owner_unknown`), as they are when several people are signed
+in to one server; on a server nobody has signed in to, they are refused with
+`not_signed_in`. Once the hive names owners, a mind whose owner has not
+signed in is refused (`owner_not_signed_in`) rather than given someone
+else's token. A mind's write runs as that person's account, so only they can
+approve it: the approver the hive names (`approved_by`) must be them. The
+view lists who signed in to each server, with the account
 (`preferred_username` from the id_token, kept only to show it; the id_token
-itself is not stored). `revoke` deletes only your own sign-in. A sign-in kept
+itself is not stored), and says whether minds use that sign-in. `revoke`
+deletes only your own sign-in. A sign-in kept
 by an earlier version (one per server, naming no principal) counts as none:
 its person signs in again.
 
@@ -271,8 +277,9 @@ Behaviour that changes for a hive that ran 0.1.0:
 - **Sign-ins are per person:** each person signs in for themselves, and the
   one sign-in per server that 0.1.0 kept counts as none, so a person runs
   `connect` again. A mind uses its owner's sign-in; until the hive names
-  owners, the one sign-in to the server, and none while several people are
-  signed in (open point 4).
+  owners, the sign-in of the only person signed in to the swarm's servers,
+  and none while several people are (open point 4). Only a named person
+  signs in: the hive refuses `connect` to the local operator password.
 - **`bearer-env` tokens go only where the operator says:** the token in
   `OMEGA_CONNECT_CRED_<NAME>` is sent only to the origins listed in
   `OMEGA_CONNECT_ORIGINS_<NAME>` (space- or comma-separated, such as
@@ -301,7 +308,7 @@ Behaviour that changes for a hive that ran 0.1.0:
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 81 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 83 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
@@ -362,8 +369,10 @@ Coverage of issue #8, which person a mind acts for:
 | Change | Tests |
 |---|---|
 | Each person signs in for themselves: their own calls use their own sign-in, revoke deletes only theirs | `test_each_person_signs_in_for_themselves` |
-| A mind uses its owner's sign-in, never another person's; until the hive names owners, the only one signed in to the server, or none, saying why | `test_a_mind_uses_its_owners_sign_in_or_the_only_one` |
+| A mind uses its owner's sign-in, never another person's; until the hive names owners, the sign-in of the only person signed in to the swarm's servers, or none, saying why | `test_a_mind_uses_its_owners_sign_in_or_the_only_one` |
+| That only person is counted over the whole swarm: with one person signed in only to one server and another only to a second, a mind is refused on both (`owner_unknown`) | `test_a_mind_uses_no_sign_in_while_different_people_are_signed_in_to_the_swarms_servers` |
 | A mind's write needs the approval of the person whose sign-in it uses; `use-tool` declares `approver: "person"`, so the operator password neither approves nor runs a write | `test_a_minds_write_needs_the_approval_of_the_person_whose_sign_in_it_uses`, `test_describe_matches_the_brief` |
+| `connect` declares `approver: "person"`: the operator password starts no sign-in (403 `person_required`) | `test_only_a_named_person_signs_in`, `test_describe_matches_the_brief` |
 
 Coverage of failed writes (open point 6):
 
@@ -412,13 +421,16 @@ settled points 4 and 6 on issue #1.
    person has not signed in, the app refuses with a clear message instead of
    using someone else's token. The hive does not put a mind's owner in
    `ctx.actor` yet (asked for in omegahive #332), so until it does, a mind
-   uses the sign-in of the only person signed in to that server in the
-   swarm, and is refused when nobody is or several people are. Each person
-   signs in for themselves, under their principal, and a mind's write needs
-   the approval of the person whose sign-in it uses
-   (`ctx.actor.approval.approved_by`, point 3). `use-tool` declares
-   `approver: "person"`, which the hive applies both to approvals and to the
-   person route (verified with point 3).
+   uses a sign-in only while one person alone is signed in to the swarm's
+   servers, all its `oauth-device` servers counted together (MesTTo, in the
+   review of #12): it is refused when nobody has signed in to the server,
+   and when several people are signed in to the swarm's servers, even each
+   to a server of their own. Each person signs in for themselves, under
+   their principal, and a mind's write needs the approval of the person
+   whose sign-in it uses (`ctx.actor.approval.approved_by`, point 3).
+   `use-tool` declares `approver: "person"`, which the hive applies both to
+   approvals and to the person route (verified with point 3); `connect`
+   declares it too, so a sign-in always belongs to a named person.
 5. **Agreed, as a separate small piece:** the mind skill for native Omega
    minds (brief, "a second, smaller piece").
 6. **Settled: failed writes** (Jon Grove on #1). When `act()` raises, the

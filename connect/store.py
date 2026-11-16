@@ -190,6 +190,12 @@ class SwarmStore:
         with self.lock:
             return self._people(self._secrets(), server)
 
+    def all_signins(self) -> dict[str, dict[str, dict]]:
+        """The sign-ins to every server, read once: {server: {principal: sign-in}}."""
+        with self.lock:
+            secrets = self._secrets()
+            return {server: self._people(secrets, server) for server in secrets}
+
     def credentials(self, server: str, principal: str | None) -> dict | None:
         """One person's sign-in to `server`, by their principal."""
         return self.signins(server).get(principal) if principal else None
