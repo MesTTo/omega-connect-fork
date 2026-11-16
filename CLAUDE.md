@@ -61,6 +61,13 @@ The brief, in short:
   certainly did not arrive (a refused connection), at most 5 times in 5
   minutes, then a new approval; when the outcome is uncertain, no blind
   repeat: check, or go back to a person.
+- Whose sign-in a mind uses (Jon on #1): its owner's, or a clear refusal,
+  never another person's token. The hive's actor for a mind does not carry
+  its owner yet (omegahive #332): `_mind_owner(ctx)` is the one place that
+  reads it, None until then; meanwhile a mind uses a server's sign-in only
+  while one person alone is signed in to it. use-tool declares approver
+  "person": the scratch hive demo is done as a named person, not with the
+  operator password.
 
 Reference: https://github.com/omega-flagship/omegahive-schematics (06-apps),
 https://github.com/omega-flagship/omega-tools (template app). The omegahive
@@ -92,7 +99,7 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
 - `connect/store.py`: per-swarm folder under `OMEGA_CONNECT_DATA_DIR`:
   servers.json (no secrets; the tools a person accepted as read, with the
   digest of each definition), secrets.bin (Fernet: each person's sign-in under
-  their principal, and which one is lent to minds), trace.jsonl (digests),
+  their principal), trace.jsonl (digests),
   intents.bin (app-level idempotency for use-tool, each answer included:
   Fernet, newest half kept past 1 MiB; a plain intents.json is moved in).
   Files mode 0600.
@@ -160,10 +167,12 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
    16 Nov 2026: the fake host runs actions as program_actions.py 832b36e
    does (`tests/test_fakehive.py` checks it); open points 3, 6 and 7 verified
    against that file and `hive/ci-constraints.txt`, 6 settled by Jon on #1
-   (failed writes: NotSent tried again, otherwise `outcome_unknown`). 4 is
-   issue #8, done on the branch `per-person-signin`: a sign-in per person,
-   lent to minds on purpose with connect and for_minds, a mind's write
-   approved by the lender.
+   (failed writes: NotSent tried again, otherwise `outcome_unknown`). 4,
+   settled by Jon on #1, is issue #8 on the branch `per-person-signin`
+   (review-1 merged in, 16 Nov 2026): a sign-in per person; a mind uses its
+   owner's, and until omegahive #332 the only one signed in to the server,
+   else it is refused; a mind's write is approved by the person whose sign-in
+   it uses; demo.py acts as the named person `ada`.
 2. Microsoft 365 showcase on a dev tenant (Microsoft 365 Developer Program):
    Entra app registration (public client, device code enabled), delegated
    scopes for reading a Teams channel, then one write (post a message) behind
@@ -171,7 +180,8 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
    servers, or a Graph-based server over streamable HTTP). A Graph-based one
    is in `examples/teams-mcp/`; `demo.py` ran it on a real tenant on 13 Nov
    2026 (the channel read, a message posted once approved).
-3. Scratch hive demo, recorded.
+3. Scratch hive demo, recorded, as a named person (use-tool declares approver
+   "person": with the operator password nobody runs or approves a write).
 4. Optional: the mind skill for native Omega minds wrapping
    `POST /api/agent/programs/omega-connect/act` (confirm with the team first).
    A standalone MeTTa plugin that calls MCP directly from Omega core already
