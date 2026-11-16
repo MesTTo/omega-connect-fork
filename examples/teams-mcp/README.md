@@ -57,7 +57,10 @@ get its own Graph token (on-behalf-of flow).
    ```
 4. **Hive**: omega-connect mounted (see the main README) with
    `OMEGA_CONNECT_SECRET_KEY` set, and a mind attached with `list-tools` and
-   `read-tool` on *allow* and `use-tool` on *ask*.
+   `read-tool` on *allow* and `use-tool` on *ask*. Do the person's steps as a
+   named person signed in to the hive, not with the local operator password:
+   `use-tool` declares `approver: "person"`, so with the operator password
+   nobody can run or approve a write.
 
 ## Demo steps
 
@@ -81,18 +84,20 @@ does not accept `organizations`.
 omega-connect adds `openid` and `profile` (to show who signed in) and
 `offline_access` (so the token can be renewed).
 
-**2. connect** (person, confirmed), on `server:teams`, with
-`{"for_minds": true}`: the sign-in is the person's own, and this lends it to
-the swarm's minds, which use no other. The result shows a code and
-`https://microsoft.com/devicelogin`, to this person only: the app's view never
-shows the code. Sign in there with the tenant account and accept the
-permissions. The app finishes the sign-in by itself; the view then shows
-`Sign-in: oauth-device (1 person signed in; lent to minds by <principal>, as <the account>)`.
+**2. connect** (person, confirmed), on `server:teams`. The sign-in is the
+person's own. The result shows a code and `https://microsoft.com/devicelogin`,
+to this person only: the app's view never shows the code. Sign in there with
+the tenant account and accept the permissions. The app finishes the sign-in by
+itself; the view then shows
+`Sign-in: oauth-device (signed in by <principal>, as <the account>; minds use this sign-in)`.
+A mind uses the sign-in of the person it belongs to; until the hive names that
+person (omegahive #332), it uses a server's sign-in only while one person alone
+is signed in to it, so sign in to `teams` as the only person.
 
 On a tenant whose security defaults block the device code, run connect with
-`{"flow": "browser", "for_minds": true}` instead. Open the address in the
-result, sign in and accept, then copy the address of the empty page the
-browser lands on and run connect again with `{"redirect_url": "<that address>"}`.
+`{"flow": "browser"}` instead. Open the address in the result, sign in and
+accept, then copy the address of the empty page the browser lands on and run
+connect again with `{"redirect_url": "<that address>"}`.
 
 **3. list-tools** (mind) with `{"server": "teams"}`. Every tool is `write` for
 now: the three Graph reads carry `"review": "not reviewed"`, because a
@@ -129,10 +134,11 @@ classed `write`.
 ```
 
 The host files an approval bound to these exact arguments and the mind waits;
-nothing is posted yet. When a person approves, the app runs the tool once, the
-message appears in the channel as the person who signed in, and the trace keeps
-digests and the hive's record id. A retry with the same idempotency key returns
-the recorded result instead of posting again.
+nothing is posted yet. The post would go out as the person who signed in, so
+only that person can approve it. Once they do, the app runs the tool once, the
+message appears in the channel as them, and the trace keeps digests, who
+approved and the hive's record id. A retry with the same idempotency key
+returns the recorded result instead of posting again.
 
 To finish, **revoke** (person, confirmed) on `server:teams` deletes the token.
 
@@ -141,8 +147,9 @@ To finish, **revoke** (person, confirmed) on `server:teams` deletes the token.
 `demo.py` walks the steps above against your tenant from a terminal, without a
 hive. It mounts omega-connect in the repository's stand-in for the host
 (`tests/fakehive.py`) and plays both parts: the mind `scout` (`list-tools` and
-`read-tool` on *allow*, `use-tool` on *ask*), and you, the person who confirms
-and approves. It starts the server itself on a free port of `127.0.0.1`, and
+`read-tool` on *allow*, `use-tool` on *ask*), and you, the person who signs in,
+confirms and approves, whom the fake host calls `ada`: a named person, as
+`use-tool` requires. It starts the server itself on a free port of `127.0.0.1`, and
 keeps the store in a temporary folder with a Fernet key made for the run;
 both are deleted at the end, and the token with them.
 

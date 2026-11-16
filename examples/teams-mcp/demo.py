@@ -148,7 +148,7 @@ class Demo:
         """Terminal controls dropped, and the token values of the sign-in (the current ones and any
         seen before) replaced."""
         try:
-            tokens = self.store.signins(SERVER_NAME)["people"].values()
+            tokens = self.store.signins(SERVER_NAME).values()
         except self.program.store_mod.StoreError:
             tokens = ()
         for token in tokens:
@@ -260,8 +260,8 @@ class Demo:
         """Authorization code with PKCE: the person signs in in a browser and pastes back the address it lands
         on. The sign-in address carries the tenant and client IDs in full, so it is opened, not printed,
         where a browser can be opened."""
-        self.call_line("connect", {"flow": "browser", "for_minds": True}, [f"server:{SERVER_NAME}"])
-        started = self.person("connect", [f"server:{SERVER_NAME}"], {"flow": "browser", "for_minds": True})
+        self.call_line("connect", {"flow": "browser"}, [f"server:{SERVER_NAME}"])
+        started = self.person("connect", [f"server:{SERVER_NAME}"], {"flow": "browser"})
         if started.get("status") != "needs_input":
             self.need(started, "connect", HINT)  # says why, then stops
         detail = started["detail"]
@@ -291,9 +291,8 @@ class Demo:
             self.say("The sign-in is still open: paste the address again, or sign in again from the same page.", 2)
 
     def device_code(self) -> None:
-        self.call_line("connect", {"for_minds": True}, [f"server:{SERVER_NAME}"])
-        detail = self.need(self.person("connect", [f"server:{SERVER_NAME}"], {"for_minds": True}), "connect",
-                           HINT)["detail"]
+        self.call_line("connect", {}, [f"server:{SERVER_NAME}"])
+        detail = self.need(self.person("connect", [f"server:{SERVER_NAME}"], {}), "connect", HINT)["detail"]
         self.say(f"Open    {detail['verification_uri']}", 2)
         self.say(f"Code    {detail['user_code']}", 2)
         self.say("Sign in with an account of the tenant and accept the permissions; the demo goes on by itself.", 2)
@@ -418,14 +417,15 @@ class Demo:
         if answer.startswith("n"):
             self.say("✗ Not approved: the request stays pending, and nothing is posted.", 2)
             return
+        # The only person signed in, whose sign-in the mind uses, so the one who approves its writes.
         self.hive.approve(approval["id"], PERSON)
         self.say(f"✓ Approved by {PERSON}. The mind sends the request again, with the same key and "
                  f"approval_id {approval['id']}.", 2)
         self.call_line("use-tool", params)
         posted = self.data(self.need(self.mind("use-tool", params, key, approval["id"]), "use-tool",
                                      HINT)).get("posted") or {}
-        signins = self.store.signins(SERVER_NAME)
-        account = (signins["people"].get(signins["minds"]) or {}).get("account") or "the account that signed in"
+        account = (self.store.credentials(SERVER_NAME, f"user:{PERSON}") or {}).get("account") \
+            or "the account that signed in"
         self.say(f"✓ Posted in Teams as {account}: message {posted.get('id')}, {posted.get('at')}", 2)
         if posted.get("url"):
             self.say(posted["url"], 4)
