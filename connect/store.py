@@ -5,7 +5,8 @@ swarm (named by a digest of the swarm id):
 
     servers.json   server records, no secrets; each keeps the tools a person
                    accepted as read, with the digest of the definition accepted
-    secrets.bin    OAuth tokens, encrypted with Fernet (AES-128-CBC + HMAC)
+    secrets.bin    OAuth tokens, each person's own under their principal;
+                   encrypted with Fernet (AES-128-CBC + HMAC)
     trace.jsonl    one line per tool call: digests only, never content; cut
                    to its newest half once it passes 1 MiB
     intents.bin    app-level idempotency records for use-tool, each with the
@@ -174,42 +175,76 @@ class SwarmStore:
         token = _fernet().encrypt(json.dumps(secrets).encode("utf-8"))
         _write_private(self.dir / "secrets.bin", token)
 
-    def credentials(self, server: str) -> dict | None:
-        with self.lock:
-            return self._secrets().get(server)
+    # Each person signs in for themselves: secrets.bin holds, per server, {"people": {principal: token}}.
+    @staticmethod
+    def _people(secrets: dict, server: str) -> dict:
+        entry = secrets.get(server)
+        if not isinstance(entry, dict) or not isinstance(entry.get("people"), dict):
+            # None yet, or the one sign-in per server of 0.2.0, which names no principal: it counts
+            # as none, and its person signs in again.
+            return {}
+        return dict(entry["people"])
 
-    def put_credentials(self, server: str, value: dict) -> None:
+    def signins(self, server: str) -> dict[str, dict]:
+        """The sign-ins to `server`, by the principal of the person who signed in."""
+        with self.lock:
+            return self._people(self._secrets(), server)
+
+    def all_signins(self) -> dict[str, dict[str, dict]]:
+        """The sign-ins to every server, read once: {server: {principal: sign-in}}."""
         with self.lock:
             secrets = self._secrets()
-            secrets[server] = value
+            return {server: self._people(secrets, server) for server in secrets}
+
+    def credentials(self, server: str, principal: str | None) -> dict | None:
+        """One person's sign-in to `server`, by their principal."""
+        return self.signins(server).get(principal) if principal else None
+
+    def put_credentials(self, server: str, principal: str, value: dict) -> None:
+        """Keep a person's sign-in to `server`, in place of any earlier one of theirs."""
+        with self.lock:
+            secrets = self._secrets()
+            people = self._people(secrets, server)
+            people[principal] = value
+            secrets[server] = {"people": people}
             self._save_secrets(secrets)
 
-    def replace_credentials(self, server: str, old: dict, new: dict) -> bool:
-        """Store `new` only if the stored credentials are still `old`, so a renewal that finishes
-        after a revoke or a new sign-in never writes over them."""
+    def replace_credentials(self, server: str, principal: str, old: dict, new: dict) -> bool:
+        """Store `new` only if the person's stored credentials are still `old`, so a renewal that
+        finishes after a revoke or a new sign-in never writes over them."""
         with self.lock:
             secrets = self._secrets()
-            if secrets.get(server) != old:
+            people = self._people(secrets, server)
+            if people.get(principal) != old:
                 return False
-            secrets[server] = new
+            people[principal] = new
+            secrets[server] = {"people": people}
             self._save_secrets(secrets)
             return True
 
-    def delete_credentials(self, server: str) -> bool:
+    def delete_credentials(self, server: str, principal: str | None = None) -> bool:
+        """Delete one person's sign-in to `server`, or with no principal every sign-in to it."""
         with self.lock:
             path = self.dir / "secrets.bin"
             if not path.exists():
                 return False
             secrets = self._secrets()
-            removed = secrets.pop(server, None) is not None
+            if principal is None:
+                removed = secrets.pop(server, None) is not None
+            else:
+                people = self._people(secrets, server)
+                removed = people.pop(principal, None) is not None
+                secrets[server] = {"people": people}
             self._save_secrets(secrets)
             return removed
 
-    def has_credentials(self, server: str) -> bool:
+    def has_credentials(self, server: str, principal: str | None = None) -> bool:
+        """Whether this person, or with no principal anyone, is signed in to `server`."""
         try:
-            return self.credentials(server) is not None
+            people = self.signins(server)
         except StoreError:
             return False
+        return bool(people) if principal is None else principal in people
 
     # ---------------------------------------------------------- traces
     def trace(self, entry: dict) -> None:

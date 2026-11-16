@@ -46,7 +46,9 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from fakehive import FakeHive, HostRefusal, run  # noqa: E402
 
-SWARM, PERSON, MIND = "demo", "operator", "scout"
+# A named person: connect and use-tool declare approver "person", which the local operator password
+# (user:operator) is not.
+SWARM, PERSON, MIND = "demo", "ada", "scout"
 SERVER_NAME = "teams"
 SCOPES = [f"https://graph.microsoft.com/{name}" for name in
           ("Team.ReadBasic.All", "Channel.ReadBasic.All", "ChannelMessage.Read.All", "ChannelMessage.Send")]
@@ -147,10 +149,11 @@ class Demo:
         """Terminal controls dropped, and the token values of the sign-in (the current ones and any
         seen before) replaced."""
         try:
-            token = self.store.credentials(SERVER_NAME) or {}
+            tokens = self.store.signins(SERVER_NAME).values()
         except self.program.store_mod.StoreError:
-            token = {}
-        self.secrets.update(value for value in (token.get("access_token"), token.get("refresh_token")) if value)
+            tokens = ()
+        for token in tokens:
+            self.secrets.update(value for value in (token.get("access_token"), token.get("refresh_token")) if value)
         text = UNSAFE.sub("", str(text))
         for secret in self.secrets:
             text = text.replace(secret, "[token removed]")
@@ -415,13 +418,15 @@ class Demo:
         if answer.startswith("n"):
             self.say("✗ Not approved: the request stays pending, and nothing is posted.", 2)
             return
+        # The only person signed in, whose sign-in the mind uses, so the one who approves its writes.
         self.hive.approve(approval["id"], PERSON)
         self.say(f"✓ Approved by {PERSON}. The mind sends the request again, with the same key and "
                  f"approval_id {approval['id']}.", 2)
         self.call_line("use-tool", params)
         posted = self.data(self.need(self.mind("use-tool", params, key, approval["id"]), "use-tool",
                                      HINT)).get("posted") or {}
-        account = (self.store.credentials(SERVER_NAME) or {}).get("account") or "the account that signed in"
+        account = (self.store.credentials(SERVER_NAME, f"user:{PERSON}") or {}).get("account") \
+            or "the account that signed in"
         self.say(f"✓ Posted in Teams as {account}: message {posted.get('id')}, {posted.get('at')}", 2)
         if posted.get("url"):
             self.say(posted["url"], 4)
