@@ -20,6 +20,13 @@ definition as the server sent it, and a call can be tied to the definition its
 caller checked: it goes out only while the session still has that definition.
 How tools are classed (read, write, hidden) is decided in program.py.
 
+Failed calls. A call that certainly never reached the server raises NotSent:
+the server could not be reached (no connection was made, so nothing went out),
+or the session ended while the call was still waiting its turn. A call that
+went out, or may have, and got no answer raises OutcomeUnknown: a timeout, or a
+connection lost while the call was out. Any other error is either the server's
+answer refusing the request or a failure before the call was handed over.
+
 Works with the MCP Python SDK 1.x (camelCase fields, streamablehttp_client)
 and 2.x (snake_case fields, streamable_http_client).
 """
@@ -51,6 +58,8 @@ _CONNECTION_CLOSED = -32000  # JSON-RPC code the SDK uses for a dropped connecti
 # -32600 from Python servers, -32001 from TypeScript ones.
 _SESSION_GONE_CODES = (-32600, 32600, -32001)
 _SESSION_GONE = re.compile(r"session (not found|terminated)", re.I)
+# JSON-RPC errors by which a server refuses a request without running it: no such method, bad params.
+_REFUSED_CODES = (-32601, -32602)
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -61,6 +70,16 @@ class EngineError(RuntimeError):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+class NotSent(EngineError):
+    """The call never reached the server, so making it again cannot run it twice: the server could not
+    be reached, or the session ended while the call was still waiting to go out."""
+
+
+class OutcomeUnknown(EngineError):
+    """The call went out, or may have, and no answer came back: a timeout, or a connection lost while
+    the call was out. It may have taken effect, so making it again could run it twice."""
 
 
 # ----------------------------------------------------------------- helpers
@@ -96,17 +115,58 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
     return text
 
 
-def is_connection_lost(exc: BaseException) -> bool:
+def session_gone(exc: BaseException) -> bool:
+    """The server answered HTTP 404 for the session id: it forgot the session (after a restart, for
+    one) and ran nothing of the request."""
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         exc = exc.exceptions[0]
     error = getattr(exc, "error", None)
-    code = getattr(error, "code", None)
-    if code == _CONNECTION_CLOSED:
+    return getattr(error, "code", None) in _SESSION_GONE_CODES \
+        and bool(_SESSION_GONE.search(str(getattr(error, "message", "") or "")))
+
+
+def is_connection_lost(exc: BaseException) -> bool:
+    if session_gone(exc):
         return True
-    if code in _SESSION_GONE_CODES and _SESSION_GONE.search(str(getattr(error, "message", "") or "")):
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    if getattr(getattr(exc, "error", None), "code", None) == _CONNECTION_CLOSED:
         return True
     return exc.__class__.__name__ in ("ClosedResourceError", "BrokenResourceError", "EndOfStream") \
         or isinstance(exc, (ConnectionError, EOFError))
+
+
+def _leaves(exc: BaseException) -> list[BaseException]:
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for inner in exc.exceptions for leaf in _leaves(inner)]
+    return [exc]
+
+
+def unreachable(exc: BaseException) -> bool:
+    """A transport that failed only because no connection to the server could be made (httpx's
+    ConnectError or ConnectTimeout, with SDK 1.x and 2.x alike): what it was to carry never went out."""
+    leaves = [leaf for leaf in _leaves(exc) if not isinstance(leaf, asyncio.CancelledError)]
+    return bool(leaves) and all(type(leaf).__name__ in ("ConnectError", "ConnectTimeout")
+                                and type(leaf).__module__.split(".")[0] in ("httpx", "httpx2", "httpcore", "httpcore2")
+                                for leaf in leaves)
+
+
+def _failure(exc: BaseException, name: str, timeout: float) -> BaseException:
+    """What a call that failed after it was handed to its session tells its caller. NotSent, OutcomeUnknown
+    and failures from before the call went out stay as they are, and so does an answer by which the
+    server refuses the request without running it. Anything else may have reached the server: no
+    answer in time, a connection lost while the call was out, an answer that could not be read."""
+    timed_out = isinstance(exc, TimeoutError) or (type(exc) is EngineError and exc.kind == "timeout")  # run_async's
+    if isinstance(exc, EngineError) and not timed_out:
+        return exc
+    if timed_out:
+        return OutcomeUnknown("timeout", f"no answer from server '{name}' within {int(timeout)} s")
+    if session_gone(exc) or getattr(getattr(exc, "error", None), "code", None) in _REFUSED_CODES:
+        return exc
+    if is_connection_lost(exc):
+        return OutcomeUnknown("connection", f"the connection to server '{name}' was lost while the call was out "
+                                            f"({describe_exception(exc)})")
+    return OutcomeUnknown("call", describe_exception(exc))
 
 
 def definition_digest(name: str, description: Any, input_schema: dict, annotations: Any) -> str:
@@ -235,6 +295,8 @@ class _Worker:
         self._ready: asyncio.Future | None = None
         self._stopping = False  # set by stop(): this worker takes no more calls and never reconnects
         self._ending = False  # the session left its loop and is closing: calls wait for a new one
+        self._cut = False  # stop() ran out of grace and cut the session
+        self._running: asyncio.Future | None = None  # the call the session is running
         self.reloads_due = 0  # tools/list_changed notifications whose reload has not run yet
 
     @property
@@ -244,7 +306,7 @@ class _Worker:
 
     async def ensure_connected(self) -> None:
         if self._stopping:
-            raise EngineError("connection", self._closed_message())
+            raise NotSent("connection", self._closed_message())
         if self.connected:
             return
         if self._ending and self._task is not None and not self._task.done():
@@ -265,7 +327,7 @@ class _Worker:
     async def submit(self, fn: Callable[[Any], Awaitable[Any]]) -> Any:
         await self.ensure_connected()
         if self._stopping:  # stop() came while this call waited for the session
-            raise EngineError("connection", self._closed_message())
+            raise NotSent("connection", self._closed_message())
         future = asyncio.get_running_loop().create_future()
         await self._queue.put((fn, future))
         return await future
@@ -285,9 +347,11 @@ class _Worker:
         if self._task and not self._task.done():
             await self._queue.put(None)
             try:
-                await asyncio.wait_for(self._task, timeout=STOP_GRACE if grace is None else grace)
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=STOP_GRACE if grace is None else grace)
             except Exception:
+                self._cut = True  # before the cancel, so that the call it cuts hears so at once
                 self._task.cancel()
+                await asyncio.wait({self._task})
 
     async def _on_message(self, message: Any) -> None:
         """What the server sends outside answers. tools/list_changed queues a reload of the tool
@@ -302,6 +366,7 @@ class _Worker:
         from mcp import ClientSession
 
         secrets = self.spec.secrets()
+        self._running = None
         try:
             async with _open_transport(self.spec, self.stderr_dir) as streams:
                 async with ClientSession(streams[0], streams[1], message_handler=self._on_message) as session:
@@ -321,9 +386,20 @@ class _Worker:
             message = describe_exception(exc, secrets)
             self.last_error = message
             logger.warning("MCP server '%s' stopped: %s", self.spec.name, message)
+            refused = unreachable(exc)
             if self._ready is not None and not self._ready.done():
-                self._ready.set_exception(EngineError("connection", message))
-            self._fail_queued(message)
+                self._ready.set_exception((NotSent if refused else EngineError)("connection", message))
+            running, self._running = self._running, None
+            if running is not None and not running.done():
+                # The transport failed under the call it was carrying (both SDKs then cancel the
+                # session's task). Only a connection that could not be made proves the call never
+                # went out.
+                running.set_exception(
+                    NotSent("connection", f"server '{self.spec.name}' could not be reached ({message}); "
+                                          "the call did not go out") if refused else
+                    OutcomeUnknown("connection", f"the connection to server '{self.spec.name}' failed while "
+                                                 f"the call was out ({message})"))
+            self._fail_queued(f"the session with '{self.spec.name}' ended before this call went out ({message})")
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
 
@@ -343,28 +419,30 @@ class _Worker:
             fn, future = item
             if future.cancelled():
                 continue
+            self._running = future
             try:
                 future.set_result(await fn(session))
             except asyncio.CancelledError:
-                # The session is being cut (stop ran out of grace): this call may already have
-                # reached the server, so its caller hears it now.
-                if not future.done():
-                    future.set_exception(EngineError(
+                if self._cut and not future.done():
+                    # stop() ran out of grace: this call may already have reached the server, so
+                    # its caller hears it now.
+                    future.set_exception(OutcomeUnknown(
                         "connection", f"the session with '{self.spec.name}' closed while this call "
                                       "was running; it may already have taken effect"))
-                raise
+                raise  # otherwise the transport failed under the call: _run says how, once it knows why
             except Exception as exc:
                 if not future.done():
                     future.set_exception(exc)
                 if is_connection_lost(exc):
                     raise
+            self._running = None
 
     def _fail_queued(self, message: str) -> None:
         """Fail every call still waiting in the queue; none of them went out."""
         while self._queue is not None and not self._queue.empty():
             pending = self._queue.get_nowait()
             if isinstance(pending, tuple) and not pending[1].done():
-                pending[1].set_exception(EngineError("connection", message))
+                pending[1].set_exception(NotSent("connection", message))
 
     def _closed_message(self) -> str:
         return f"the session with '{self.spec.name}' closed before this call went out; try again"
@@ -475,7 +553,8 @@ class McpEngine:
         """Call a tool. With `expect`, the digest of the definition the caller checked, the call
         goes out only while the session still has that definition: the list can be reloaded in
         between, on tools/list_changed or on a reconnect. Otherwise EngineError "tool_changed",
-        and nothing was sent."""
+        and nothing was sent. A call that fails raises NotSent, OutcomeUnknown, or the error that
+        says it never went out or that the server refused it (module docstring)."""
         worker = await self.connect(swarm, spec)
         timeout = spec.timeout
 
@@ -488,12 +567,18 @@ class McpEngine:
             return invoke
 
         try:
-            result = await self.run_async(worker.submit(invoke_on(worker)), timeout + 5)
+            try:
+                result = await self.run_async(worker.submit(invoke_on(worker)), timeout + 5)
+            except Exception as exc:
+                if not (retry_on_drop and is_connection_lost(exc)):
+                    raise
+                worker = await self.connect(swarm, spec)
+                result = await self.run_async(worker.submit(invoke_on(worker)), timeout + 5)
         except Exception as exc:
-            if not (retry_on_drop and is_connection_lost(exc)):
+            failure = _failure(exc, spec.name, timeout)
+            if failure is exc:
                 raise
-            worker = await self.connect(swarm, spec)
-            result = await self.run_async(worker.submit(invoke_on(worker)), timeout + 5)
+            raise failure from exc
         return render_result(result)
 
     def shutdown(self) -> None:
