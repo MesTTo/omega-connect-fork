@@ -344,8 +344,8 @@ def test_a_write_that_never_went_out_is_not_reported_as_unknown(program, demo_ur
 
 
 def test_a_write_that_never_reached_the_server_is_sent_again(hive, late_demo):
-    """Open point 6: a write goes out again only when the attempt certainly never reached the server,
-    such as a refused connection. Here the server comes up while use-tool tries again, in the same act."""
+    """Open point 6: a write goes out again only when the attempt certainly did not run, such as a
+    refused connection. Here the server comes up while use-tool tries again, in the same act."""
     add(hive, "s1", "demo", late_demo.url)  # nothing listens there yet
     note = {"server": "demo", "tool": "create_note", "arguments": {"title": "plan", "text": "x"}}
     approval_id = person_approves(hive, "s1", "w1", **note)
@@ -360,14 +360,33 @@ def test_a_write_that_never_reached_the_server_is_sent_again(hive, late_demo):
     assert traced["status"] == "done" and 1 < traced["attempts"] <= 5
 
 
+def test_a_write_the_server_has_no_session_for_goes_out_again_on_a_new_one(hive, restartable_demo, monkeypatch):
+    """The server restarts between the approval and the write, so it answers the app's old session with
+    HTTP 404: it no longer has that session and ran nothing. The MCP specification has the client open a
+    new session; use-tool does, and sends the write again there, within its five attempts. The note is
+    created once."""
+    add(hive, "s1", "demo", restartable_demo.url)
+    mind(hive, "s1", "list-tools", "k1", server="demo")  # the app holds a session with the server
+    note = {"server": "demo", "tool": "create_note", "arguments": {"title": "plan", "text": "x"}}
+    approval_id = person_approves(hive, "s1", "w1", **note)
+    restartable_demo.restart()
+    sent = tool_calls(hive.program, monkeypatch)
+    done = mind(hive, "s1", "use-tool", "w1", approval_id, **note)
+    assert done["status"] == "done" and done["detail"]["result"]["text"] == "saved 'plan'"
+    assert sent == ["create_note", "create_note"]  # the first one met the 404
+    assert restartable_demo.calls() == ["create_note plan"]  # created once
+    traced = [t for t in hive.program.store_mod.SwarmStore("s1").traces(10) if t["action"] == "use-tool"]
+    assert [(t["status"], t.get("attempts")) for t in traced] == [("done", 2)]
+
+
 def test_a_write_that_cannot_reach_the_server_stops_after_five_attempts(hive, late_demo, monkeypatch):
     """At most five attempts in one act, none started later than RETRY_WINDOW after the first. Then the
-    write fails with nothing sent, and only a new request, which a person approves again, can send it."""
+    write fails with nothing run, and only a new request, which a person approves again, can send it."""
     monkeypatch.setattr(hive.program, "RETRY_DELAYS", (0.05,))
     add(hive, "s1", "demo", late_demo.url)  # nothing ever listens there
     note = {"server": "demo", "tool": "create_note", "arguments": {"title": "plan", "text": "x"}}
     failed = write(hive, "s1", "w1", **note)
-    assert failed["status"] == "error" and "tried 5 times; nothing went out" in failed["message"]
+    assert failed["status"] == "error" and "tried 5 times; the tool never ran" in failed["message"]
     store = hive.program.store_mod.SwarmStore("s1")
     assert (store.traces(1)[0]["status"], store.traces(1)[0]["attempts"]) == ("error", 5)
     assert store.intent("w1") is None  # nothing went out, so nothing is unknown
@@ -588,8 +607,8 @@ def test_a_restarted_server_gets_a_new_session_with_its_tools_loaded_again(hive,
 
     assert use("add", a=1, b=1)["status"] == "done"
     restartable_demo.restart(DEMO_ADD_DESCRIPTION="Add two integers, version 2.")
-    assert use("add", a=1, b=2)["status"] == "error"  # how the app learns of the restart; a write is not retried
-    assert use("add", a=1, b=3)["detail"]["result"]["text"] == "4"  # a new session
+    # The 404 is how the app learns of the restart; the call ran nothing, so it goes out again on a new session.
+    assert use("add", a=1, b=2)["detail"]["result"]["text"] == "3"
     review(hive, "s1", "demo")
     assert mind(hive, "s1", "read-tool", "r1", server="demo", tool="add", arguments={"a": 2, "b": 2})["status"] == "done"
 

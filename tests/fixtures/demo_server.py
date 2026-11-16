@@ -7,6 +7,8 @@ DEMO_ADD_DESCRIPTION replaces the description of `add`, so a restart can come
 back with a changed definition.
 DEMO_EXTRA_TOOLS=<n> adds n read-only tools, echo_000 and on, for tests about
 how many tools a view can hold.
+DEMO_CALL_LOG=<file> gets a line for every call that changes the notes; the
+file outlives a restart, so a test can count what ran.
 """
 
 import os
@@ -71,9 +73,16 @@ def crash() -> str:
     os._exit(3)
 
 
+def _log_call(*words: str) -> None:
+    if os.environ.get("DEMO_CALL_LOG"):
+        with open(os.environ["DEMO_CALL_LOG"], "a", encoding="utf-8") as log:
+            log.write(" ".join(words) + "\n")
+
+
 @server.tool()
 def create_note(title: str, text: str) -> str:
     """Save a note. Changes state."""
+    _log_call("create_note", title)
     NOTES[title] = text
     return f"saved '{title}'"
 
@@ -81,6 +90,7 @@ def create_note(title: str, text: str) -> str:
 @server.tool()
 def delete_notes() -> str:
     """Delete every note. Changes state."""
+    _log_call("delete_notes")
     NOTES.clear()
     return "deleted"
 

@@ -24,10 +24,11 @@ What the app guarantees on its side
   OAuth tokens are encrypted at rest. Neither appears in results, views,
   traces, logs or errors.
 - Tool output is returned as data, capped in size, and labelled untrusted.
-- A write is sent again only when it certainly never reached the server (a
-  refused connection, a session that ended before the call went out), a few
-  times within one act. When it may have reached the server and no answer
-  came back, use-tool says the outcome is unknown and does not send it again.
+- A write is sent again only when it certainly did not run (a refused
+  connection, a session that ended before the call went out, a 404 for a
+  session the server no longer has), a few times within one act. When it may
+  have reached the server and no answer came back, use-tool says the outcome
+  is unknown and does not send it again.
 - Every call is traced with server, tool, digests of arguments and result,
   status, actor, who approved it and the hive's record id for the act.
 - Streamable HTTP by default. stdio servers (which start processes on the
@@ -93,7 +94,7 @@ _REFRESH_LOCKS_GUARD = threading.Lock()
 # effect, which the host treats as a consequential (non-read) action.
 USE_TOOL_EFFECT: str | None = None
 
-# use-tool sends a call again only when the attempt certainly never reached the server (open point 6):
+# use-tool sends a call again only when the attempt certainly did not run (open point 6):
 # at most WRITE_ATTEMPTS in one act, RETRY_DELAYS seconds apart, none started later than RETRY_WINDOW
 # seconds after the first; well within the five minutes the flagship allows for such repeats before a
 # person approves again.
@@ -759,7 +760,7 @@ async def _call_tool(ctx, swarm, store, action, items, params):
 
 
 def _retry_wait(action: str, attempts: int, started: float, changed: bool) -> float | None:
-    """Seconds to wait before trying again a call that never reached the server, or None when it has
+    """Seconds to wait before trying again a call that certainly did not run, or None when it has
     had its tries. A tool that changed is classed again at once, one more time for read-tool; use-tool
     tries up to WRITE_ATTEMPTS times in all, none starting later than RETRY_WINDOW after the first."""
     if action != "use-tool":
@@ -787,7 +788,8 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments, trace, s
     # The class is checked against the definition the session holds, and the call goes out only
     # while it still holds that one. If the list is reloaded in between (tools/list_changed, a
     # reconnect), nothing is sent and the tool is classed once more by its new definition.
-    # use-tool also tries again a call that never reached the server (_retry_wait).
+    # use-tool also tries again a call that certainly did not run (_retry_wait): a server that
+    # answers 404 for a session it no longer has ran nothing, and the next attempt opens a new one.
     started, attempts = time.monotonic(), 0
     while True:
         attempts += 1
@@ -827,7 +829,7 @@ async def _run_tool(ctx, swarm, store, action, record, tool, arguments, trace, s
             store.trace({**trace, "status": "unknown", "reason": message[:200], **tries})
             return _outcome_unknown(record["name"], tool, message), True
         if unsent and attempts > 1:
-            message += f" (tried {attempts} times; nothing went out)"
+            message += f" (tried {attempts} times; the tool never ran)"
         store.trace({**trace, "status": "error", "reason": message[:200], **tries})
         kind = getattr(failure, "kind", "call" if sent else "connection")
         return _result("error", message, detail={"type": kind}), sent and not unsent

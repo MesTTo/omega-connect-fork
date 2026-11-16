@@ -58,8 +58,10 @@ The brief, in short:
   on the person route, get that). The person route records nothing for our
   actions: `record_id` None.
 - Failed writes (Jon on #1): repeat automatically only when the attempt
-  certainly did not arrive (a refused connection), at most 5 times in 5
-  minutes, then a new approval; when the outcome is uncertain, no blind
+  certainly did not arrive (a refused connection; for use-tool also a 404
+  for a session the server no longer has, which ran nothing, and after which
+  MCP has the client open a new session), at most 5 times in 5 minutes,
+  then a new approval; when the outcome is uncertain, no blind
   repeat: check, or go back to a person.
 
 Reference: https://github.com/omega-flagship/omegahive-schematics (06-apps),
@@ -74,15 +76,17 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
   thread; one long-lived task per (swarm, server) owns transport and
   ClientSession (anyio cancel scopes must stay in one task). Callers submit
   work through a queue. Dropped connections, and sessions the server forgot
-  (HTTP 404 after a restart), reconnect on the next call; only read-classed
-  calls are retried. Each session loads the tool list when it opens and on
+  (HTTP 404 after a restart), reconnect on the next call; the engine itself
+  retries only read-classed calls. Each session loads the tool list when it
+  opens and on
   `notifications/tools/list_changed` (the reload runs in the worker's task:
   SDK 1.x calls the message handler inside its receive loop). Every tool keeps
   a digest of its definition; `call(expect=digest)` sends nothing if the
   definition changed. New auth headers mean a new session; the old one
   finishes its calls (grace = call timeout). A failed call raises NotSent
-  (never reached the server: no connection could be made, or the session
-  ended while it waited its turn) or OutcomeUnknown (may have reached it, no
+  (certainly did not run: no connection could be made, the session ended
+  while it waited its turn, or the server answered 404 for a session it no
+  longer has) or OutcomeUnknown (may have reached it, no
   answer); when the transport fails under a call, both SDKs cancel the
   session's task, and the transport's own error (httpx ConnectError or not)
   decides, in `_run`. use-tool tries a NotSent write again (5 attempts, none
@@ -122,7 +126,7 @@ can finish it.
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests            # 76 tests, ~80 s, localhost only
+python -m pytest -q tests            # 78 tests, ~80 s, localhost only
 python -m pytest -q examples/teams-mcp   # 32 tests, ~17 s, Graph simulated in memory
 ```
 

@@ -90,17 +90,20 @@ def wide_demo():
 
 
 @pytest.fixture
-def restartable_demo():
-    """Demo server that a test can restart on the same address, with other settings."""
-    proc, url = _start_demo({})
+def restartable_demo(tmp_path):
+    """Demo server that a test can restart on the same address, with other settings. calls() lists the
+    calls that changed its notes, across restarts."""
+    log = tmp_path / "demo-calls.log"
+    proc, url = _start_demo({"DEMO_CALL_LOG": str(log)})
     demo = SimpleNamespace(url=url, proc=proc)
 
     def restart(**env):
         demo.proc.terminate()
         demo.proc.wait(timeout=10)
-        demo.proc, _ = _start_demo(env, port=int(url.rsplit(":", 1)[1].split("/")[0]))
+        demo.proc, _ = _start_demo({"DEMO_CALL_LOG": str(log), **env}, port=int(url.rsplit(":", 1)[1].split("/")[0]))
 
     demo.restart = restart
+    demo.calls = lambda: log.read_text("utf-8").splitlines() if log.exists() else []
     yield demo
     demo.proc.terminate()
     demo.proc.wait(timeout=10)

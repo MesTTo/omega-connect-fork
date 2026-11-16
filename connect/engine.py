@@ -20,12 +20,15 @@ definition as the server sent it, and a call can be tied to the definition its
 caller checked: it goes out only while the session still has that definition.
 How tools are classed (read, write, hidden) is decided in program.py.
 
-Failed calls. A call that certainly never reached the server raises NotSent:
-the server could not be reached (no connection was made, so nothing went out),
-or the session ended while the call was still waiting its turn. A call that
-went out, or may have, and got no answer raises OutcomeUnknown: a timeout, or a
-connection lost while the call was out. Any other error is either the server's
-answer refusing the request or a failure before the call was handed over.
+Failed calls. A call that certainly did not run raises NotSent: the server
+could not be reached (no connection was made, so nothing went out), the
+session ended while the call was still waiting its turn, or the server
+answered HTTP 404 for a session it no longer has (after a restart, for one),
+which means it ran nothing; the MCP specification then has the client open a
+new session, as the next call does. A call that went out, or may have, and got
+no answer raises OutcomeUnknown: a timeout, or a connection lost while the
+call was out. Any other error is either the server's answer refusing the
+request or a failure before the call was handed over.
 
 Works with the MCP Python SDK 1.x (camelCase fields, streamablehttp_client)
 and 2.x (snake_case fields, streamable_http_client).
@@ -73,8 +76,9 @@ class EngineError(RuntimeError):
 
 
 class NotSent(EngineError):
-    """The call never reached the server, so making it again cannot run it twice: the server could not
-    be reached, or the session ended while the call was still waiting to go out."""
+    """The call certainly did not run, so making it again cannot run it twice: the server could not be
+    reached, the session ended while the call was still waiting to go out, or the server answered that
+    it no longer has the session (HTTP 404), and so ran nothing."""
 
 
 class OutcomeUnknown(EngineError):
@@ -154,14 +158,19 @@ def unreachable(exc: BaseException) -> bool:
 def _failure(exc: BaseException, name: str, timeout: float) -> BaseException:
     """What a call that failed after it was handed to its session tells its caller. NotSent, OutcomeUnknown
     and failures from before the call went out stay as they are, and so does an answer by which the
-    server refuses the request without running it. Anything else may have reached the server: no
-    answer in time, a connection lost while the call was out, an answer that could not be read."""
+    server refuses the request without running it. A 404 for a session the server no longer has is
+    NotSent: it ran nothing, and the session it ended is replaced by the next call's. Anything else may
+    have reached the server: no answer in time, a connection lost while the call was out, an answer
+    that could not be read."""
     timed_out = isinstance(exc, TimeoutError) or (type(exc) is EngineError and exc.kind == "timeout")  # run_async's
     if isinstance(exc, EngineError) and not timed_out:
         return exc
     if timed_out:
         return OutcomeUnknown("timeout", f"no answer from server '{name}' within {int(timeout)} s")
-    if session_gone(exc) or getattr(getattr(exc, "error", None), "code", None) in _REFUSED_CODES:
+    if session_gone(exc):
+        return NotSent("connection", f"server '{name}' no longer has this session, as after a restart, and ran "
+                                     f"nothing ({describe_exception(exc)})")
+    if getattr(getattr(exc, "error", None), "code", None) in _REFUSED_CODES:
         return exc
     if is_connection_lost(exc):
         return OutcomeUnknown("connection", f"the connection to server '{name}' was lost while the call was out "
