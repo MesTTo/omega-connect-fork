@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,7 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from conftest import ACCOUNT, AUTH_CODE, DEMO, NEW_TOKEN, REFRESH, SECRET
-from fakehive import FakeHive, HostRefusal, mind_actor, run, validate_graph
+from fakehive import Ctx, FakeHive, HostRefusal, mind_actor, run, validate_graph
 
 PERSON = "ada"   # the hive's ids carry no kind; ctx.actor says the kind
 MIND = "scout"
@@ -98,13 +99,42 @@ def origin(url):
     return f"{urlsplit(url).scheme}://{urlsplit(url).netloc}"
 
 
-@pytest.fixture
-def hive(program):
+def attached(program):
+    """A fake hive where the mind may list and read, and use-tool asks a person."""
     h = FakeHive(program)
     for action in ("list-servers", "list-tools", "inspect-tool", "read-tool"):
         h.attach(MIND, action, "allow")
     h.attach(MIND, "use-tool", "ask")
     return h
+
+
+def calls_to_act(program, monkeypatch):
+    """Every act() the hive makes from here on, by action."""
+    calls, act = [], program.act
+
+    async def recorded(ctx, action, items, params):
+        calls.append(action)
+        return await act(ctx, action, items, params)
+
+    monkeypatch.setattr(program, "act", recorded)
+    return calls
+
+
+def tool_calls(program, monkeypatch):
+    """The tool of every call that the app hands to the engine from here on."""
+    calls, call = [], program.ENGINE.call
+
+    async def counted(swarm, spec, tool, *args, **kwargs):
+        calls.append(tool)
+        return await call(swarm, spec, tool, *args, **kwargs)
+
+    monkeypatch.setattr(program.ENGINE, "call", counted)
+    return calls
+
+
+@pytest.fixture
+def hive(program):
+    return attached(program)
 
 
 # ------------------------------------------------------------------ describe
@@ -177,24 +207,40 @@ def test_use_tool_waits_for_a_person(hive, demo_url):
     assert traced["approved_by"] == f"user:{PERSON}" and traced["approval_id"] == first["approval_id"]
 
 
-def test_identical_retry_returns_the_recorded_result(hive, demo_url):
+def test_identical_retry_returns_the_recorded_result(hive, demo_url, monkeypatch):
+    """use-tool declares no revalidate, so the hive answers an identical retry of a write it recorded as
+    done from its own record, without calling the app or asking a person again."""
     add(hive, "s1", "demo", demo_url)
     review(hive, "s1", "demo")
     args = {"title": "once", "text": "1"}
     first = write(hive, "s1", "w1", server="demo", tool="create_note", arguments=args)
     write(hive, "s1", "w-del", server="demo", tool="delete_notes", arguments={})
+    calls = calls_to_act(hive.program, monkeypatch)
     retry = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
-    assert retry == first  # recorded, not re-run: the note stays deleted
+    assert retry == first and calls == [] and hive.pending() == []  # recorded, not re-run
     assert "once" not in mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"]
     with pytest.raises(HostRefusal) as conflict:
         mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments={"title": "other", "text": "2"})
     assert conflict.value.status == 409
 
 
-def test_an_identical_retry_is_a_recovery_that_runs_nothing_again(hive, demo_url, monkeypatch):
-    """The hive delivers an identical retry of a write it recorded as done as a recovery: act() gets
-    the approval the write first ran under and ctx.actor.recovery. The app answers from its own record;
-    once it no longer keeps that record, it still runs nothing, and says so."""
+def test_a_recovery_answers_from_the_apps_record_or_the_hives(program, demo_url, monkeypatch):
+    """The hive delivers a recovery only for an action that declares revalidate: true, which use-tool does
+    not; here it does, so the fake host delivers one. act() gets the approval the write first ran under,
+    ctx.actor.recovery and the hive's record of the answer (ctx.command.recorded_result). The app answers
+    from its own record, or, once it no longer keeps that, with the hive's; with neither it refuses. The
+    write never runs again."""
+    describe = program.describe
+
+    def revalidating():
+        described = describe()
+        for action in described["actions"]:
+            if action["id"] == "use-tool":
+                action["revalidate"] = True
+        return described
+
+    monkeypatch.setattr(program, "describe", revalidating)
+    hive = attached(program)
     add(hive, "s1", "demo", demo_url)
     review(hive, "s1", "demo")
     note = {"server": "demo", "tool": "create_note", "arguments": {"title": "once", "text": "1"}}
@@ -202,28 +248,33 @@ def test_an_identical_retry_is_a_recovery_that_runs_nothing_again(hive, demo_url
     first = mind(hive, "s1", "use-tool", "w1", approval_id, **note)
     assert first["status"] == "done"
     run(hive.person_act("s1", PERSON, "use-tool", [], {"server": "demo", "tool": "delete_notes", "arguments": {}}))
-    actors, act = [], hive.program.act
+    actors, act = [], program.act
 
     async def recorded(ctx, action, items, params):
-        actors.append(dict(ctx.actor))
+        actors.append((dict(ctx.actor), dict(ctx.command)))
         return await act(ctx, action, items, params)
 
-    monkeypatch.setattr(hive.program, "act", recorded)
+    monkeypatch.setattr(program, "act", recorded)
+    sent = tool_calls(program, monkeypatch)
     assert mind(hive, "s1", "use-tool", "w1", **note) == first  # no new approval is asked for
-    assert actors[-1]["recovery"] is True and actors[-1]["approval"]["id"] == approval_id
-    store = hive.program.store_mod.SwarmStore("s1")
+    actor, command = actors[-1]
+    assert actor["recovery"] is True and actor["approval"]["id"] == approval_id
+    assert command["recorded_result"] == first and command["revalidation_supported"] is True
+    store = program.store_mod.SwarmStore("s1")
     store.drop_intent("w1")  # the app no longer keeps the answer
-    again = mind(hive, "s1", "use-tool", "w1", **note)
+    assert mind(hive, "s1", "use-tool", "w1", **note) == first  # the hive's record of it
+    assert sent == []
+    ctx = Ctx(swarm_id="s1", actor={**mind_actor("s1", MIND, APPROVED), "recovery": True},
+              command={"idempotency_key": "w1", "record_id": command["record_id"], "recorded_result": None})
+    again = run(program.act(ctx, "use-tool", [], note))  # neither record
     assert again["status"] == "refused" and again["detail"]["type"] == "recovery"
     assert store.traces(1)[0]["reason"] == "recovery-without-record"
     notes = mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"]
-    assert notes == "(no notes)"  # neither retry wrote the note again
+    assert notes == "(no notes)" and sent == ["list_notes"]  # no recovery wrote the note again
 
 
 def test_app_level_idempotency_also_holds(program, demo_url):
     """Defence in depth: the app keeps its own intent records for use-tool."""
-    from fakehive import Ctx
-
     hive = FakeHive(program)
     add(hive, "s1", "demo", demo_url)
     ctx = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND, APPROVED), command={"idempotency_key": "same"})
@@ -231,18 +282,16 @@ def test_app_level_idempotency_also_holds(program, demo_url):
     first = run(program.act(ctx, "use-tool", [], params))
     second = run(program.act(ctx, "use-tool", [], params))
     assert first == second
-    # delivered again after a failed attempt: the app's own record answers, so nothing runs and nothing warns
-    ctx.command["prior_failed"] = True
-    assert run(program.act(ctx, "use-tool", [], params)) == first
     other = run(program.act(ctx, "use-tool", [], {**params, "arguments": {"title": "c", "text": "d"}}))
     assert other["status"] == "refused" and other["detail"]["type"] == "conflict"
 
 
-def test_a_write_delivered_again_after_a_failure_warns_it_may_repeat(hive, demo_url, monkeypatch):
-    """PROGRAMS.md 9d: an attempt that failed has an unknown effect. The hive delivers it again only
-    after a new approval. The app finds the record it wrote just before the first attempt went out,
-    with no result kept, so it runs the tool and says the first attempt may already have taken
-    effect. It needs no ctx.command.prior_failed, which the agent route does not send."""
+def test_a_write_delivered_again_after_a_failure_is_not_sent_again(hive, demo_url, monkeypatch):
+    """The tool ran, then the app failed before keeping its answer, so the hive records the act as
+    failed. The mind's identical retry comes back after a new approval, with the same record id and no
+    prior_failed. The app finds the record it wrote just before the call went out, with no answer: the
+    write may have taken effect, so it is not sent again (open point 6). The mind checks, and makes a
+    new request if the write did not happen; that one a person approves again."""
     add(hive, "s1", "demo", demo_url)
     review(hive, "s1", "demo")
     args = {"title": "plan", "text": "x"}
@@ -261,24 +310,27 @@ def test_a_write_delivered_again_after_a_failure_warns_it_may_repeat(hive, demo_
     with pytest.raises(HostRefusal) as failed:
         mind(hive, "s1", "use-tool", "w1", first["approval_id"], server="demo", tool="create_note", arguments=args)
     assert failed.value.code == "program_error"
-    assert mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"] == "plan"
     with pytest.raises(HostRefusal) as spent:  # the spent approval does not cover a second delivery
         mind(hive, "s1", "use-tool", "w1", first["approval_id"], server="demo", tool="create_note", arguments=args)
     assert spent.value.code == "not_approved"
     again = mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args)
     assert again["status"] == "approval_required" and again["approval_id"] != first["approval_id"]
     hive.approve(again["approval_id"], PERSON)
-    done = mind(hive, "s1", "use-tool", "w1", again["approval_id"], server="demo", tool="create_note", arguments=args)
-    assert done["status"] == "done" and done["detail"]["prior_failed"] is True
-    assert "may already have taken effect" in done["message"]
-    assert done["detail"]["result"]["text"] == "saved 'plan'"
+    sent = tool_calls(hive.program, monkeypatch)
+    unknown = mind(hive, "s1", "use-tool", "w1", again["approval_id"], server="demo", tool="create_note", arguments=args)
+    assert unknown["status"] == "refused" and unknown["detail"]["type"] == "outcome_unknown" and sent == []
+    assert "read-tool" in unknown["message"] and "new request" in unknown["message"]
+    ran, delivered = [t for t in hive.program.store_mod.SwarmStore("s1").traces(10) if t["action"] == "use-tool"]
+    assert (ran["status"], delivered["status"]) == ("done", "unknown")
+    assert ran["record_id"] == delivered["record_id"]  # the same act, delivered again
+    assert mind(hive, "s1", "read-tool", "r1", server="demo", tool="list_notes")["detail"]["result"]["text"] == "plan"
+    assert mind(hive, "s1", "use-tool", "w1", server="demo", tool="create_note", arguments=args) == unknown  # recorded
+    assert write(hive, "s1", "w2", server="demo", tool="create_note", arguments=args)["status"] == "done"
 
 
 def test_a_write_that_never_went_out_is_not_reported_as_unknown(program, demo_url, monkeypatch):
-    """A call the engine never sends (its tool changed twice while being checked) leaves no record,
-    so the next delivery runs it with no warning."""
-    from fakehive import Ctx
-
+    """A call the engine never sends (its tool changed each time it was checked) leaves no record, so
+    the next delivery runs it."""
     hive = FakeHive(program)
     add(hive, "s1", "demo", demo_url)
     ctx = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND, APPROVED), command={"idempotency_key": "w1"})
@@ -292,8 +344,60 @@ def test_a_write_that_never_went_out_is_not_reported_as_unknown(program, demo_ur
     assert run(program.act(ctx, "use-tool", [], params))["status"] == "error"
     assert program.store_mod.SwarmStore("s1").intent("w1") is None
     monkeypatch.setattr(program.ENGINE, "call", call)
-    done = run(program.act(ctx, "use-tool", [], params))
-    assert done["status"] == "done" and "prior_failed" not in done["detail"]
+    assert run(program.act(ctx, "use-tool", [], params))["status"] == "done"
+
+
+def test_a_write_that_never_reached_the_server_is_sent_again(hive, late_demo):
+    """Open point 6: a write goes out again only when the attempt certainly never reached the server,
+    such as a refused connection. Here the server comes up while use-tool tries again, in the same act."""
+    add(hive, "s1", "demo", late_demo.url)  # nothing listens there yet
+    note = {"server": "demo", "tool": "create_note", "arguments": {"title": "plan", "text": "x"}}
+    approval_id = person_approves(hive, "s1", "w1", **note)
+    starting = threading.Thread(target=late_demo.start)
+    starting.start()
+    try:
+        done = mind(hive, "s1", "use-tool", "w1", approval_id, **note)
+    finally:
+        starting.join()
+    assert done["status"] == "done" and done["detail"]["result"]["text"] == "saved 'plan'"
+    [traced] = [t for t in hive.program.store_mod.SwarmStore("s1").traces(10) if t["action"] == "use-tool"]
+    assert traced["status"] == "done" and 1 < traced["attempts"] <= 5
+
+
+def test_a_write_that_cannot_reach_the_server_stops_after_five_attempts(hive, late_demo, monkeypatch):
+    """At most five attempts in one act, none started later than RETRY_WINDOW after the first. Then the
+    write fails with nothing sent, and only a new request, which a person approves again, can send it."""
+    monkeypatch.setattr(hive.program, "RETRY_DELAYS", (0.05,))
+    add(hive, "s1", "demo", late_demo.url)  # nothing ever listens there
+    note = {"server": "demo", "tool": "create_note", "arguments": {"title": "plan", "text": "x"}}
+    failed = write(hive, "s1", "w1", **note)
+    assert failed["status"] == "error" and "tried 5 times; nothing went out" in failed["message"]
+    store = hive.program.store_mod.SwarmStore("s1")
+    assert (store.traces(1)[0]["status"], store.traces(1)[0]["attempts"]) == ("error", 5)
+    assert store.intent("w1") is None  # nothing went out, so nothing is unknown
+    assert mind(hive, "s1", "use-tool", "w1", **note) == failed  # the hive keeps that answer
+    monkeypatch.setattr(hive.program, "RETRY_WINDOW", 0.0)
+    once = write(hive, "s1", "w2", **note)
+    assert once["status"] == "error" and "tried" not in once["message"] and "attempts" not in store.traces(1)[0]
+
+
+def test_a_write_whose_outcome_is_unknown_is_not_sent_again(hive, demo_url, monkeypatch):
+    """A write that went out and got no answer may have taken effect. use-tool does not send it again: it
+    answers refused, outcome_unknown, telling the mind to check and, if the write did not happen, to make
+    a new request, which a person approves again."""
+    add(hive, "s1", "demo", demo_url, timeout=1)
+    sent = tool_calls(hive.program, monkeypatch)
+    slow = {"server": "demo", "tool": "slow", "arguments": {"seconds": 3}}  # write until a person accepts it
+    unknown = write(hive, "s1", "w1", **slow)
+    assert unknown["status"] == "refused" and unknown["detail"] == {"type": "outcome_unknown", "server": "demo",
+                                                                    "tool": "slow"}
+    assert "no answer from server 'demo'" in unknown["message"] and "read-tool" in unknown["message"]
+    assert sent == ["slow"]
+    traced = hive.program.store_mod.SwarmStore("s1").traces(1)[0]
+    assert traced["status"] == "unknown" and "attempts" not in traced
+    assert mind(hive, "s1", "use-tool", "w1", **slow) == unknown and sent == ["slow"]  # the hive's record answers
+    again = mind(hive, "s1", "use-tool", "w2", **slow)
+    assert again["status"] == "approval_required"
 
 
 def test_a_minds_write_needs_a_person_even_under_allow(hive, demo_url):
@@ -355,7 +459,7 @@ def test_a_new_servers_tools_stay_write_until_a_person_accepts_its_reads(hive, d
 
     with pytest.raises(HostRefusal) as by_a_mind:
         run(hive.agent_act("s1", MIND, "accept-reads", {"server": "demo"}, "k3"))
-    assert by_a_mind.value.code == "not_for_agents"
+    assert by_a_mind.value.code == "not_for_minds"
     with pytest.raises(HostRefusal) as unconfirmed:
         run(hive.person_act("s1", PERSON, "accept-reads", ["server:demo"], {}))
     assert unconfirmed.value.code == "confirm_required"
@@ -516,7 +620,7 @@ def test_no_rule_means_deny(program, demo_url):
     add(hive, "s1", "demo", demo_url)
     with pytest.raises(HostRefusal) as denied:
         mind(hive, "s1", "read-tool", "k1", server="demo", tool="add", arguments={"a": 1, "b": 1})
-    assert denied.value.code == "policy_denied"
+    assert denied.value.code == "policy_refused"
 
 
 def test_stdio_is_off_by_default(hive, monkeypatch):
@@ -562,10 +666,19 @@ def test_url_rules(hive):
     assert add(hive, "s1", "d", "https://example.com/mcp")["status"] == "done"
 
 
-def test_credential_keys_in_a_body_are_refused_by_the_host(hive, demo_url):
+def test_credential_keys_in_a_request_are_refused_by_the_host(hive, demo_url):
+    """The host refuses a request whose params carry a credential-like or identity key at the top level,
+    which is why add-server takes signin. It does not look inside signin: there the app takes only the
+    fields it knows, and a token is not one of them."""
     with pytest.raises(HostRefusal) as refused:
-        add(hive, "s1", "x", demo_url, signin={"kind": "bearer-env", "token": "abc"})
-    assert refused.value.code == "credential_in_body"
+        add(hive, "s1", "x", demo_url, token="abc")
+    assert refused.value.code == "credential_in_request"
+    with pytest.raises(HostRefusal) as named:
+        add(hive, "s1", "x", demo_url, principal="user:eve")
+    assert named.value.code == "identity_in_request"
+    nested = add(hive, "s1", "x", demo_url, signin={"kind": "bearer-env", "token": "abc"})
+    assert nested["status"] == "refused" and "OMEGA_CONNECT_CRED_" in nested["message"]
+    assert mind(hive, "s1", "list-servers", "k1")["detail"]["servers"] == []
 
 
 def test_swarms_are_isolated(hive, demo_url):
@@ -933,8 +1046,6 @@ def test_a_browser_sign_in_finishes_only_with_its_own_address_for_its_own_person
                                                                              "server:m365")
     landed = fake_authority.authorize(started["detail"]["authorization_url"])
     assert connect("eve", redirect_url=landed)["status"] == "refused"  # another person's sign-in
-    from fakehive import Ctx
-
     as_mind = Ctx(swarm_id="s1", actor=mind_actor("s1", MIND))  # the host offers connect to people only
     assert run(hive.program.act(as_mind, "connect", ["server:m365"], {"redirect_url": landed}))["status"] == "refused"
     elsewhere = connect(PERSON, redirect_url=landed.replace("/common/oauth2/nativeclient", "/elsewhere"))

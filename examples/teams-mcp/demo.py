@@ -46,7 +46,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from fakehive import FakeHive, HostRefusal, run  # noqa: E402
 
-SWARM, PERSON, MIND = "demo", "operator", "scout"
+# A named person: use-tool declares approver "person", which the local operator password (user:operator) is not.
+SWARM, PERSON, MIND = "demo", "ada", "scout"
 SERVER_NAME = "teams"
 SCOPES = [f"https://graph.microsoft.com/{name}" for name in
           ("Team.ReadBasic.All", "Channel.ReadBasic.All", "ChannelMessage.Read.All", "ChannelMessage.Send")]

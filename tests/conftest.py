@@ -106,6 +106,23 @@ def restartable_demo():
     demo.proc.wait(timeout=10)
 
 
+@pytest.fixture
+def late_demo():
+    """An address where no demo server listens, so connections to it are refused, until start()
+    brings one up there."""
+    port = free_port()
+    demo = SimpleNamespace(url=f"http://127.0.0.1:{port}/mcp", proc=None)
+
+    def start():
+        demo.proc, _ = _start_demo({}, port=port)
+
+    demo.start = start
+    yield demo
+    if demo.proc is not None:
+        demo.proc.terminate()
+        demo.proc.wait(timeout=10)
+
+
 SECRET = "tok-9f2c4b7e51d0a8"
 NEW_TOKEN = "tok-3e8a1c6f92b47d"  # what a refresh returns when a test asks for a new token
 REFRESH = "rt-55aa66bb"  # the first refresh token; the ones that follow start with it too

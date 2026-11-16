@@ -32,20 +32,35 @@ The brief, in short:
   message, detail?, graph?, task?}`. `started` needs `task.id`.
 - Return `stale` (with the current graph) when `params.base_revision` is old.
 - The host refuses bodies with `principal`, `actor`, `swarm_id`, `agent_id`,
-  `member_id` or credential-like keys. That is why add-server takes `signin`,
-  not `auth`.
+  `member_id` or credential-like keys (token, secret, password, api key, any
+  `*_key` but its own retry keys such as `idempotency_key`) at the top level of
+  the body or params: 400 identity_in_request / credential_in_request; nested
+  keys pass. That is why add-server takes `signin`, not `auth`.
 - Confirm payloads are canonical JSON, integers only: no floats in params of
   confirm actions.
 - Raise `PermissionError` in `view()` to refuse a swarm.
 - Capabilities are not a sandbox; the app runs in the hive process.
-- The minds' route, from `hive/core/program_actions.py` on flagship main
-  (private; not in the 04fc3f2 copy), confirmed by MesTTo, to verify on a
-  scratch hive: "ask" answers `approval_required` with an `approval_id`; the
-  repeated request reaches `act()` with `ctx.actor.approval = {id,
-  binding_digest, approved_by}` (`None` under "allow"); an identical retry of
-  a done act comes back with the original approval and `recovery: true`.
-  By MesTTo's reading, to confirm: a mind's failed attempt comes back after a
-  new approval with the same `record_id` and no `prior_failed`.
+- How the hive runs an action, verified in `hive/core/program_actions.py` at
+  omegahive main 832b36e (in `../omegahive-files-for-alessio-832b36e/`, sent
+  by Jon; the repository is private: read it, never copy or quote its code
+  here): "ask" answers `approval_required` with an `approval_id`; the repeated
+  request reaches `act()` with `ctx.actor.approval = {id, binding_digest,
+  approved_by}` (`None` under "allow"). For `approver: "person"`, an approval
+  by `user:operator` is refused (409 person_approval_required), and so is the
+  operator password on the person route (403 person_required). Every act of a
+  mind is recorded under its idempotency key, whatever status `act()` gives;
+  an identical retry of a done act gets the recorded result without reaching
+  `act()`, unless the action declares `revalidate: true`: then it is a
+  recovery (`recovery: true`, the original approval,
+  `ctx.command.recorded_result`). use-tool declares no revalidate. An act that
+  raised is failed: its identical retry comes back after a new approval with
+  the same `record_id` and no `prior_failed` (only `person_activity` actions,
+  on the person route, get that). The person route records nothing for our
+  actions: `record_id` None.
+- Failed writes (Jon on #1): repeat automatically only when the attempt
+  certainly did not arrive (a refused connection), at most 5 times in 5
+  minutes, then a new approval; when the outcome is uncertain, no blind
+  repeat: check, or go back to a person.
 
 Reference: https://github.com/omega-flagship/omegahive-schematics (06-apps),
 https://github.com/omega-flagship/omega-tools (template app). The omegahive
@@ -65,8 +80,15 @@ repo (with `hive/PROGRAMS.md` and `hive.programs_check`) opens ~19–20 Nov.
   SDK 1.x calls the message handler inside its receive loop). Every tool keeps
   a digest of its definition; `call(expect=digest)` sends nothing if the
   definition changed. New auth headers mean a new session; the old one
-  finishes its calls (grace = call timeout). Supports MCP SDK 1.x and 2.x:
-  `mcp>=1.30,<3`, 1.30 being the lowest version tested.
+  finishes its calls (grace = call timeout). A failed call raises NotSent
+  (never reached the server: no connection could be made, or the session
+  ended while it waited its turn) or OutcomeUnknown (may have reached it, no
+  answer); when the transport fails under a call, both SDKs cancel the
+  session's task, and the transport's own error (httpx ConnectError or not)
+  decides, in `_run`. use-tool tries a NotSent write again (5 attempts, none
+  after 30 s) and answers OutcomeUnknown with `refused`, `outcome_unknown`.
+  Supports MCP SDK 1.x and 2.x: `mcp>=1.30,<3`, 1.30 being the lowest
+  version tested.
 - `connect/store.py`: per-swarm folder under `OMEGA_CONNECT_DATA_DIR`:
   servers.json (no secrets; the tools a person accepted as read, with the
   digest of each definition), secrets.bin (Fernet: each person's sign-in under
@@ -101,7 +123,7 @@ can finish it.
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests            # 67 tests, ~75 s, localhost only
+python -m pytest -q tests            # 79 tests, ~85 s, localhost only
 python -m pytest -q examples/teams-mcp   # 32 tests, ~17 s, Graph simulated in memory
 ```
 
@@ -135,10 +157,13 @@ cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-c
    write only with a person's approval, bearer tokens only to listed origins,
    the 400-item view, input checks, durable store, browser sign-in with PKCE.
    Then: recoveries never run a tool twice, use-tool's records encrypted.
-   Open points 3 (confirmed by MesTTo), 6 and 7 (dependencies, MesTTo's
-   check) are to verify on a scratch hive; 4 is issue #8, done on the branch
-   `per-person-signin`: a sign-in per person, lent to minds on purpose with
-   connect and for_minds, a mind's write approved by the lender.
+   16 Nov 2026: the fake host runs actions as program_actions.py 832b36e
+   does (`tests/test_fakehive.py` checks it); open points 3, 6 and 7 verified
+   against that file and `hive/ci-constraints.txt`, 6 settled by Jon on #1
+   (failed writes: NotSent tried again, otherwise `outcome_unknown`). 4 is
+   issue #8, done on the branch `per-person-signin`: a sign-in per person,
+   lent to minds on purpose with connect and for_minds, a mind's write
+   approved by the lender.
 2. Microsoft 365 showcase on a dev tenant (Microsoft 365 Developer Program):
    Entra app registration (public client, device code enabled), delegated
    scopes for reading a Teams channel, then one write (post a message) behind

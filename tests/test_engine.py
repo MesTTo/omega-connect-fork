@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from conftest import DEMO, ROOT
+from conftest import DEMO, ROOT, free_port
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def test_forget_while_a_call_is_running(program, engine):
             return await session.call_tool("add", {"a": 1, "b": 2})
 
         started = time.monotonic()
-        with pytest.raises(program.engine_mod.EngineError) as closed:
+        with pytest.raises(program.engine_mod.NotSent) as closed:  # it never went out
             asyncio.run(engine.run_async(old.submit(add), 10))
         assert closed.value.kind == "connection" and time.monotonic() - started < 2
         assert not old.connected
@@ -88,11 +88,43 @@ def test_a_call_running_past_the_stop_grace_fails_at_once(program, engine, monke
         time.sleep(0.5)  # the slow call is out
         started = time.monotonic()
         engine.forget("sw", "demo")
-        with pytest.raises(program.engine_mod.EngineError) as cut:
+        with pytest.raises(program.engine_mod.OutcomeUnknown) as cut:
             running.result(timeout=15)
         elapsed = time.monotonic() - started
     assert elapsed < 5
     assert cut.value.kind == "connection" and "may already have taken effect" in cut.value.message
+
+
+def test_a_call_that_finds_no_server_is_not_sent(program, engine, restartable_demo):
+    """A refused connection proves the call never went out, when a session opens and also when the
+    server goes away while a session is open: both SDKs then cancel the session, and only the
+    transport's own error tells the two apart from a call cut once it was out."""
+    eng = program.engine_mod
+    nobody = spec(program, name="nobody", transport="http", url=f"http://127.0.0.1:{free_port()}/mcp",
+                  command=None, args=[], timeout=5)
+    with pytest.raises(eng.NotSent):
+        asyncio.run(engine.connect("sw", nobody))
+    with pytest.raises(eng.NotSent):
+        call(engine, nobody, "add", {"a": 1, "b": 2}, retry=False)
+    s = spec(program, transport="http", url=restartable_demo.url, command=None, args=[], timeout=5)
+    assert call(engine, s, "add", {"a": 1, "b": 2}, retry=False).text == "3"
+    restartable_demo.proc.terminate()
+    restartable_demo.proc.wait(timeout=10)
+    with pytest.raises(eng.NotSent) as refused:
+        call(engine, s, "add", {"a": 1, "b": 2}, retry=False)
+    assert "could not be reached" in refused.value.message and "did not go out" in refused.value.message
+    restartable_demo.restart()
+    assert call(engine, s, "add", {"a": 2, "b": 2}, retry=False).text == "4"  # a new session
+
+
+def test_a_call_cut_once_it_was_out_has_an_unknown_outcome(program, engine, demo_url):
+    """The server takes the call and dies before it answers: the call may have taken effect. SDK 2.x says
+    the stream ended without a response; 1.x says nothing, and the call runs out of time."""
+    s = spec(program, transport="http", url=demo_url, command=None, args=[], timeout=2)
+    assert call(engine, s, "add", {"a": 1, "b": 2}, retry=False).text == "3"
+    with pytest.raises(program.engine_mod.OutcomeUnknown) as cut:
+        call(engine, s, "crash", retry=False)
+    assert cut.value.kind in ("connection", "timeout")
 
 
 def test_a_call_goes_out_only_on_the_definition_it_was_checked_against(program, engine):
@@ -112,8 +144,9 @@ def test_a_call_goes_out_only_on_the_definition_it_was_checked_against(program, 
 
 def test_call_timeout(program, engine):
     s = spec(program, timeout=1)
-    with pytest.raises(Exception):
+    with pytest.raises(program.engine_mod.OutcomeUnknown) as late:
         call(engine, s, "slow", {"seconds": 5})
+    assert late.value.kind == "timeout" and "within 1 s" in late.value.message
 
 
 def test_tool_error_is_not_a_crash(program, engine):
