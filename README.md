@@ -348,7 +348,7 @@ the repository is private until it opens, and neither file is copied here).
 The first review (Dot, for Jon Grove, on 8051f30) answered each point; what
 MesTTo described of the minds' route (pull requests #3–#11, and on issue #2
 that a recovery comes only for `revalidate: true`) matches that file; Jon
-settled point 6 on issue #1.
+settled points 4 and 6 on issue #1.
 
 1. **Settled: `use-tool` declares no effect.** The contract defines only
    `"effect": "read"`, for actions that change nothing and are safe to repeat;
@@ -373,13 +373,8 @@ settled point 6 on issue #1.
    said on #2). `use-tool` declares no `revalidate`. So traces keep the
    approver, the approval's id and `record_id`; a mind's `use-tool` with no
    approval is refused; and an identical retry never runs a tool twice.
-4. **Later, on its own branch: which person a mind acts for.** Today a server
-   uses the token of the person who last completed `connect`, and the view
-   shows which account that is. Issue #8 proposes a sign-in per person, which
-   a person lends to the swarm's minds on purpose, with a mind's write
-   approved by the lender and `use-tool` declaring `approver: "person"` (only
-   a named person, never the local operator password; PROGRAMS.md 9d). It is
-   not in this branch: it comes later, on the branch `per-person-signin`.
+4. **Settled by Jon Grove on #1:** a mind uses its owner's sign-in, or that of
+   the only person signed in to the server. Implemented on `per-person-signin` (#12).
 5. **Agreed, as a separate small piece:** the mind skill for native Omega
    minds (brief, "a second, smaller piece").
 6. **Settled: failed writes** (Jon Grove on #1). When `act()` raises, the
