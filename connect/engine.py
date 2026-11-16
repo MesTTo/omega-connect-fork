@@ -10,11 +10,25 @@ be entered and exited by the same task, so sessions cannot be shared across
 those loops. The engine therefore runs one private event loop in a daemon
 thread. Each server gets a long-lived task there that owns its transport and
 ClientSession; callers hand work to it through a queue. A dropped connection is
-noticed on the next call and reopened.
+noticed on the next call and reopened, and so is a session the server no longer
+knows (HTTP 404 after a restart). Headers are fixed when a transport opens, so
+new credentials get a new session; the old one finishes what it is running.
 
-Classification. A tool is "read" only when the server marks it with the
-readOnlyHint annotation and the owner has not reclassed it; everything else is
-"write". The owner can also hide a tool.
+Tool lists. Each session loads the tool list when it opens and again when the
+server sends notifications/tools/list_changed. Every tool keeps a digest of its
+definition as the server sent it, and a call can be tied to the definition its
+caller checked: it goes out only while the session still has that definition.
+How tools are classed (read, write, hidden) is decided in program.py.
+
+Failed calls. A call that certainly did not run raises NotSent: the server
+could not be reached (no connection was made, so nothing went out), the
+session ended while the call was still waiting its turn, or the server
+answered HTTP 404 for a session it no longer has (after a restart, for one),
+which means it ran nothing; the MCP specification then has the client open a
+new session, as the next call does. A call that went out, or may have, and got
+no answer raises OutcomeUnknown: a timeout, or a connection lost while the
+call was out. Any other error is either the server's answer refusing the
+request or a failure before the call was handed over.
 
 Works with the MCP Python SDK 1.x (camelCase fields, streamablehttp_client)
 and 2.x (snake_case fields, streamable_http_client).
@@ -23,6 +37,7 @@ and 2.x (snake_case fields, streamable_http_client).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -41,6 +56,13 @@ STOP_GRACE = 10.0  # seconds a closing session gets to finish the call it is run
 MAX_RESULT_CHARS = 8000
 MAX_DESCRIPTION_CHARS = 300
 _CONNECTION_CLOSED = -32000  # JSON-RPC code the SDK uses for a dropped connection
+# HTTP 404 for a session id: the server forgot the session (after a restart, for one). SDK 1.x says
+# "Session terminated" (code 32600), 2.x passes on the server's error: "Session not found" with
+# -32600 from Python servers, -32001 from TypeScript ones.
+_SESSION_GONE_CODES = (-32600, 32600, -32001)
+_SESSION_GONE = re.compile(r"session (not found|terminated)", re.I)
+# JSON-RPC errors by which a server refuses a request without running it: no such method, bad params.
+_REFUSED_CODES = (-32601, -32602)
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -51,6 +73,17 @@ class EngineError(RuntimeError):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+class NotSent(EngineError):
+    """The call certainly did not run, so making it again cannot run it twice: the server could not be
+    reached, the session ended while the call was still waiting to go out, or the server answered that
+    it no longer has the session (HTTP 404), and so ran nothing."""
+
+
+class OutcomeUnknown(EngineError):
+    """The call went out, or may have, and no answer came back: a timeout, or a connection lost while
+    the call was out. It may have taken effect, so making it again could run it twice."""
 
 
 # ----------------------------------------------------------------- helpers
@@ -86,13 +119,75 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
     return text
 
 
+def session_gone(exc: BaseException) -> bool:
+    """The server answered HTTP 404 for the session id: it forgot the session (after a restart, for
+    one) and ran nothing of the request."""
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    error = getattr(exc, "error", None)
+    return getattr(error, "code", None) in _SESSION_GONE_CODES \
+        and bool(_SESSION_GONE.search(str(getattr(error, "message", "") or "")))
+
+
 def is_connection_lost(exc: BaseException) -> bool:
+    if session_gone(exc):
+        return True
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         exc = exc.exceptions[0]
     if getattr(getattr(exc, "error", None), "code", None) == _CONNECTION_CLOSED:
         return True
     return exc.__class__.__name__ in ("ClosedResourceError", "BrokenResourceError", "EndOfStream") \
         or isinstance(exc, (ConnectionError, EOFError))
+
+
+def _leaves(exc: BaseException) -> list[BaseException]:
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for inner in exc.exceptions for leaf in _leaves(inner)]
+    return [exc]
+
+
+def unreachable(exc: BaseException) -> bool:
+    """A transport that failed only because no connection to the server could be made (httpx's
+    ConnectError or ConnectTimeout, with SDK 1.x and 2.x alike): what it was to carry never went out."""
+    leaves = [leaf for leaf in _leaves(exc) if not isinstance(leaf, asyncio.CancelledError)]
+    return bool(leaves) and all(type(leaf).__name__ in ("ConnectError", "ConnectTimeout")
+                                and type(leaf).__module__.split(".")[0] in ("httpx", "httpx2", "httpcore", "httpcore2")
+                                for leaf in leaves)
+
+
+def _failure(exc: BaseException, name: str, timeout: float) -> BaseException:
+    """What a call that failed after it was handed to its session tells its caller. NotSent, OutcomeUnknown
+    and failures from before the call went out stay as they are, and so does an answer by which the
+    server refuses the request without running it. A 404 for a session the server no longer has is
+    NotSent: it ran nothing, and the session it ended is replaced by the next call's. Anything else may
+    have reached the server: no answer in time, a connection lost while the call was out, an answer
+    that could not be read."""
+    timed_out = isinstance(exc, TimeoutError) or (type(exc) is EngineError and exc.kind == "timeout")  # run_async's
+    if isinstance(exc, EngineError) and not timed_out:
+        return exc
+    if timed_out:
+        return OutcomeUnknown("timeout", f"no answer from server '{name}' within {int(timeout)} s")
+    if session_gone(exc):
+        return NotSent("connection", f"server '{name}' no longer has this session, as after a restart, and ran "
+                                     f"nothing ({describe_exception(exc)})")
+    if getattr(getattr(exc, "error", None), "code", None) in _REFUSED_CODES:
+        return exc
+    if is_connection_lost(exc):
+        return OutcomeUnknown("connection", f"the connection to server '{name}' was lost while the call was out "
+                                            f"({describe_exception(exc)})")
+    return OutcomeUnknown("call", describe_exception(exc))
+
+
+def definition_digest(name: str, description: Any, input_schema: dict, annotations: Any) -> str:
+    """sha256 of a tool's definition as the server sent it: name, full description, input schema
+    and annotations. It changes when the definition changes; what the tool does can change
+    without it."""
+    if hasattr(annotations, "model_dump"):  # wire names (readOnlyHint) with SDK 1.x and 2.x alike
+        annotations = annotations.model_dump(by_alias=True, exclude_none=True, mode="json")
+    definition = {"name": name, "description": str(description or ""), "input_schema": input_schema,
+                  "annotations": dict(annotations or {})}
+    data = json.dumps(definition, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
 # ----------------------------------------------------------------- data
@@ -123,10 +218,11 @@ class ServerSpec:
 @dataclass
 class ToolInfo:
     name: str
-    description: str
+    description: str  # cleaned and capped, for showing
     input_schema: dict
     read_only_hint: bool
     destructive_hint: bool
+    digest: str = ""  # definition_digest() of the definition as the server sent it
 
 
 # ----------------------------------------------------------------- transports
@@ -189,6 +285,13 @@ async def _list_all_tools(session) -> list:
 
 # ----------------------------------------------------------------- worker
 
+_RELOAD_TOOLS = object()  # queue item: the server said its tool list changed
+
+
+async def _nothing(session) -> None:
+    return None
+
+
 class _Worker:
     def __init__(self, spec: ServerSpec, stderr_dir: str | None):
         self.spec = spec
@@ -200,21 +303,29 @@ class _Worker:
         self._task: asyncio.Task | None = None
         self._ready: asyncio.Future | None = None
         self._stopping = False  # set by stop(): this worker takes no more calls and never reconnects
+        self._ending = False  # the session left its loop and is closing: calls wait for a new one
+        self._cut = False  # stop() ran out of grace and cut the session
+        self._running: asyncio.Future | None = None  # the call the session is running
+        self.reloads_due = 0  # tools/list_changed notifications whose reload has not run yet
 
     @property
     def connected(self) -> bool:
-        return (not self._stopping and self._task is not None and not self._task.done()
+        return (not self._stopping and not self._ending and self._task is not None and not self._task.done()
                 and self._ready is not None and self._ready.done() and self._ready.exception() is None)
 
     async def ensure_connected(self) -> None:
         if self._stopping:
-            raise EngineError("connection", self._closed_message())
+            raise NotSent("connection", self._closed_message())
         if self.connected:
             return
+        if self._ending and self._task is not None and not self._task.done():
+            await asyncio.wait({self._task})  # let the old session close; its queue is not this call's
         if self._task is None or self._task.done():
             loop = asyncio.get_running_loop()
             self._queue = asyncio.Queue()
             self._ready = loop.create_future()
+            self.reloads_due = 0  # a new session loads the whole list anyway
+            self._ending = False
             self._task = loop.create_task(self._run())
         try:
             await asyncio.wait_for(asyncio.shield(self._ready), timeout=self.spec.connect_timeout)
@@ -225,27 +336,49 @@ class _Worker:
     async def submit(self, fn: Callable[[Any], Awaitable[Any]]) -> Any:
         await self.ensure_connected()
         if self._stopping:  # stop() came while this call waited for the session
-            raise EngineError("connection", self._closed_message())
+            raise NotSent("connection", self._closed_message())
         future = asyncio.get_running_loop().create_future()
         await self._queue.put((fn, future))
         return await future
 
-    async def stop(self) -> None:
+    async def settle(self) -> None:
+        """Wait until the tool list reflects every change the server has announced so far: the
+        reloads are queued, so an empty item queued after them is done once they are."""
+        if self.reloads_due and self.connected:
+            future = asyncio.get_running_loop().create_future()
+            await self._queue.put((_nothing, future))
+            await future
+
+    async def stop(self, grace: float | None = None) -> None:
+        """Take no more calls, finish the ones already queued, then close. After `grace` seconds
+        (STOP_GRACE by default) the session is cut, even in the middle of a call."""
         self._stopping = True
         if self._task and not self._task.done():
             await self._queue.put(None)
             try:
-                await asyncio.wait_for(self._task, timeout=STOP_GRACE)
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=STOP_GRACE if grace is None else grace)
             except Exception:
+                self._cut = True  # before the cancel, so that the call it cuts hears so at once
                 self._task.cancel()
+                await asyncio.wait({self._task})
+
+    async def _on_message(self, message: Any) -> None:
+        """What the server sends outside answers. tools/list_changed queues a reload of the tool
+        list, which _run does in its own task: SDK 1.x calls this handler from inside the
+        session's receive loop, where waiting for an answer would deadlock."""
+        message = getattr(message, "root", message)  # SDK 1.x wraps notifications in ServerNotification
+        if getattr(message, "method", None) == "notifications/tools/list_changed" and self._queue is not None:
+            self.reloads_due += 1
+            self._queue.put_nowait(_RELOAD_TOOLS)
 
     async def _run(self) -> None:
         from mcp import ClientSession
 
         secrets = self.spec.secrets()
+        self._running = None
         try:
             async with _open_transport(self.spec, self.stderr_dir) as streams:
-                async with ClientSession(streams[0], streams[1]) as session:
+                async with ClientSession(streams[0], streams[1], message_handler=self._on_message) as session:
                     init = await session.initialize()
                     info = attr(init, "server_info", "serverInfo")
                     self.server_info = clean_text(
@@ -254,45 +387,71 @@ class _Worker:
                     self.last_error = None
                     if not self._ready.done():
                         self._ready.set_result(True)
-                    while True:
-                        item = await self._queue.get()
-                        if item is None:
-                            self._fail_queued(self._closed_message())  # now, not after the session closes
-                            break
-                        fn, future = item
-                        if future.cancelled():
-                            continue
-                        try:
-                            future.set_result(await fn(session))
-                        except asyncio.CancelledError:
-                            # The session is being cut (stop ran out of grace): this call may
-                            # already have reached the server, so its caller hears it now.
-                            if not future.done():
-                                future.set_exception(EngineError(
-                                    "connection", f"the session with '{self.spec.name}' closed while this call "
-                                                  "was running; it may already have taken effect"))
-                            raise
-                        except Exception as exc:
-                            if not future.done():
-                                future.set_exception(exc)
-                            if is_connection_lost(exc):
-                                raise
+                    try:
+                        await self._serve(session)
+                    finally:
+                        self._ending = True  # set before the session closes, so a retry waits for a new one
         except BaseException as exc:  # noqa: BLE001
             message = describe_exception(exc, secrets)
             self.last_error = message
             logger.warning("MCP server '%s' stopped: %s", self.spec.name, message)
+            refused = unreachable(exc)
             if self._ready is not None and not self._ready.done():
-                self._ready.set_exception(EngineError("connection", message))
-            self._fail_queued(message)
+                self._ready.set_exception((NotSent if refused else EngineError)("connection", message))
+            running, self._running = self._running, None
+            if running is not None and not running.done():
+                # The transport failed under the call it was carrying (both SDKs then cancel the
+                # session's task). Only a connection that could not be made proves the call never
+                # went out.
+                running.set_exception(
+                    NotSent("connection", f"server '{self.spec.name}' could not be reached ({message}); "
+                                          "the call did not go out") if refused else
+                    OutcomeUnknown("connection", f"the connection to server '{self.spec.name}' failed while "
+                                                 f"the call was out ({message})"))
+            self._fail_queued(f"the session with '{self.spec.name}' ended before this call went out ({message})")
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
+
+    async def _serve(self, session) -> None:
+        """Run queued calls and tool-list reloads one at a time, until stop() or a lost session."""
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                self._fail_queued(self._closed_message())  # now, not after the session closes
+                return
+            if item is _RELOAD_TOOLS:
+                # A list that cannot be reloaded ends the session (the error leaves this loop);
+                # the next call opens a new one, which loads the list again.
+                await self._refresh_tools(session)
+                self.reloads_due -= 1
+                continue
+            fn, future = item
+            if future.cancelled():
+                continue
+            self._running = future
+            try:
+                future.set_result(await fn(session))
+            except asyncio.CancelledError:
+                if self._cut and not future.done():
+                    # stop() ran out of grace: this call may already have reached the server, so
+                    # its caller hears it now.
+                    future.set_exception(OutcomeUnknown(
+                        "connection", f"the session with '{self.spec.name}' closed while this call "
+                                      "was running; it may already have taken effect"))
+                raise  # otherwise the transport failed under the call: _run says how, once it knows why
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                if is_connection_lost(exc):
+                    raise
+            self._running = None
 
     def _fail_queued(self, message: str) -> None:
         """Fail every call still waiting in the queue; none of them went out."""
         while self._queue is not None and not self._queue.empty():
             pending = self._queue.get_nowait()
-            if pending and not pending[1].done():
-                pending[1].set_exception(EngineError("connection", message))
+            if isinstance(pending, tuple) and not pending[1].done():
+                pending[1].set_exception(NotSent("connection", message))
 
     def _closed_message(self) -> str:
         return f"the session with '{self.spec.name}' closed before this call went out; try again"
@@ -307,12 +466,14 @@ class _Worker:
             schema = attr(tool, "input_schema", "inputSchema", default={}) or {}
             if hasattr(schema, "model_dump"):
                 schema = schema.model_dump()
+            description = attr(tool, "description", default="")
             tools[name] = ToolInfo(
                 name=name,
-                description=clean_text(attr(tool, "description", default=""), MAX_DESCRIPTION_CHARS),
+                description=clean_text(description, MAX_DESCRIPTION_CHARS),
                 input_schema=dict(schema),
                 read_only_hint=bool(attr(ann, "read_only_hint", "readOnlyHint", default=False)) if ann else False,
                 destructive_hint=bool(attr(ann, "destructive_hint", "destructiveHint", default=False)) if ann else False,
+                digest=definition_digest(name, description, dict(schema), ann),
             )
         self.tools = tools
 
@@ -369,15 +530,14 @@ class McpEngine:
         key = (swarm, spec.name)
         with self._lock:
             worker = self._workers.get(key)
-            if worker is None or _spec_changed(worker.spec, spec):
-                old = worker
-                worker = _Worker(spec, self.stderr_dir)
-                self._workers[key] = worker
-            else:
-                old = None
-                worker.spec.auth_headers = spec.auth_headers  # refreshed credentials
+            if worker is not None and not _spec_changed(worker.spec, spec):
+                return worker
+            old = worker
+            worker = self._workers[key] = _Worker(spec, self.stderr_dir)
         if old is not None:
-            self._future(old.stop())
+            # A new address or new credentials. New calls go to the new session; the old one
+            # finishes the calls it already has, each within its timeout, then closes.
+            self._future(old.stop(grace=old.spec.timeout + STOP_GRACE))
         return worker
 
     def peek(self, swarm: str, name: str) -> _Worker | None:
@@ -390,25 +550,44 @@ class McpEngine:
             self._future(worker.stop())
 
     async def connect(self, swarm: str, spec: ServerSpec) -> _Worker:
+        """A connected worker whose tool list reflects every change announced so far."""
         worker = self.worker(swarm, spec)
         await self.run_async(worker.ensure_connected(), spec.connect_timeout + 5)
+        if worker.reloads_due:
+            await self.run_async(worker.settle(), spec.timeout + 5)  # may wait for a call already running
         return worker
 
     async def call(self, swarm: str, spec: ServerSpec, tool: str, arguments: dict,
-                   retry_on_drop: bool) -> CallOutcome:
+                   retry_on_drop: bool, expect: str | None = None) -> CallOutcome:
+        """Call a tool. With `expect`, the digest of the definition the caller checked, the call
+        goes out only while the session still has that definition: the list can be reloaded in
+        between, on tools/list_changed or on a reconnect. Otherwise EngineError "tool_changed",
+        and nothing was sent. A call that fails raises NotSent, OutcomeUnknown, or the error that
+        says it never went out or that the server refused it (module docstring)."""
         worker = await self.connect(swarm, spec)
         timeout = spec.timeout
 
-        async def invoke(session):
-            return await asyncio.wait_for(session.call_tool(tool, arguments), timeout=timeout)
+        def invoke_on(worker: _Worker):
+            async def invoke(session):  # runs in the worker's task, after any reload queued before it
+                if expect is not None and getattr(worker.tools.get(tool), "digest", None) != expect:
+                    raise EngineError("tool_changed", f"'{tool}' changed on server '{spec.name}' before this "
+                                                      "call went out; nothing was sent")
+                return await asyncio.wait_for(session.call_tool(tool, arguments), timeout=timeout)
+            return invoke
 
         try:
-            result = await self.run_async(worker.submit(invoke), timeout + 5)
+            try:
+                result = await self.run_async(worker.submit(invoke_on(worker)), timeout + 5)
+            except Exception as exc:
+                if not (retry_on_drop and is_connection_lost(exc)):
+                    raise
+                worker = await self.connect(swarm, spec)
+                result = await self.run_async(worker.submit(invoke_on(worker)), timeout + 5)
         except Exception as exc:
-            if not (retry_on_drop and is_connection_lost(exc)):
+            failure = _failure(exc, spec.name, timeout)
+            if failure is exc:
                 raise
-            worker = await self.connect(swarm, spec)
-            result = await self.run_async(worker.submit(invoke), timeout + 5)
+            raise failure from exc
         return render_result(result)
 
     def shutdown(self) -> None:
@@ -428,8 +607,10 @@ class McpEngine:
 
 
 def _spec_changed(old: ServerSpec, new: ServerSpec) -> bool:
-    return (old.transport, old.url, old.command, tuple(old.args)) != \
-        (new.transport, new.url, new.command, tuple(new.args))
+    # Headers count: the transport sends the ones it was opened with, so a renewed token needs a
+    # new session.
+    return (old.transport, old.url, old.command, tuple(old.args), old.auth_headers) != \
+        (new.transport, new.url, new.command, tuple(new.args), new.auth_headers)
 
 
 def render_result(result: Any) -> CallOutcome:

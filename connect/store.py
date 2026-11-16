@@ -3,14 +3,20 @@
 Layout under OMEGA_CONNECT_DATA_DIR (default ~/.omega-connect), one folder per
 swarm (named by a digest of the swarm id):
 
-    servers.json   server records, no secrets
-    secrets.bin    OAuth tokens, encrypted with Fernet (AES-128-CBC + HMAC)
-    trace.jsonl    one line per tool call: digests only, never content
-    intents.json   app-level idempotency records for use-tool
+    servers.json   server records, no secrets; each keeps the tools a person
+                   accepted as read, with the digest of the definition accepted
+    secrets.bin    OAuth tokens, each person's own under their principal;
+                   encrypted with Fernet (AES-128-CBC + HMAC)
+    trace.jsonl    one line per tool call: digests only, never content; cut
+                   to its newest half once it passes 1 MiB
+    intents.bin    app-level idempotency records for use-tool, each with the
+                   answer it gave, encrypted with Fernet like the tokens; cut
+                   to the newest half once they pass 1 MiB
 
 The encryption key comes from OMEGA_CONNECT_SECRET_KEY (a Fernet key). Without
-it the store refuses to keep credentials: it fails closed rather than writing
-tokens in clear. Files are created with mode 0600.
+it the store refuses to keep credentials or use-tool's records: it fails closed
+rather than writing tokens or tool results in clear. Files are created with
+mode 0600, and every write is flushed to disk before it is relied on.
 """
 
 from __future__ import annotations
@@ -26,7 +32,12 @@ from typing import Any
 
 SERVER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 CRED_VARIABLE = re.compile(r"^OMEGA_CONNECT_CRED_[A-Z0-9_]{1,60}$")
-TRACE_KEEP = 2000
+# trace.jsonl is cut to its newest half once it grows past this, so a view, which reads it whole,
+# reads at most this much however many calls the swarm has made.
+TRACE_MAX_BYTES = 1 << 20
+# use-tool's records (intents.bin) are cut the same way, measured before encryption.
+INTENTS_MAX_BYTES = 1 << 20
+INTENTS = "use-tool's records"  # what _fernet() names when it cannot keep them
 
 
 class StoreError(RuntimeError):
@@ -51,23 +62,36 @@ def _base_dir() -> Path:
 
 
 def _write_private(path: Path, data: bytes) -> None:
+    """Write the file whole or not at all: a temporary file flushed to disk, renamed over the old
+    one, then the folder flushed, so after a crash the file is the old one or the new one."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
+    _fsync_folder(path.parent)
 
 
-def _fernet():
+def _fsync_folder(folder: Path) -> None:
+    fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fernet(what: str = "credentials"):
     key = os.environ.get("OMEGA_CONNECT_SECRET_KEY", "").strip()
     if not key:
         raise StoreError("no_secret_key",
-                         "the operator has not set OMEGA_CONNECT_SECRET_KEY, so credentials cannot be stored")
+                         f"the operator has not set OMEGA_CONNECT_SECRET_KEY, so {what} cannot be stored")
     try:
         from cryptography.fernet import Fernet
     except ImportError:
-        raise StoreError("no_crypto", "the 'cryptography' package is required to store credentials")
+        raise StoreError("no_crypto", f"the 'cryptography' package is required to store {what}")
     try:
         return Fernet(key.encode("ascii"))
     except Exception:
@@ -126,6 +150,20 @@ class SwarmStore:
                 reclass[tool] = cls
             self._save_servers(servers)
 
+    def accept_reads(self, server: str, digests: dict[str, str], by: str, whole_server: bool) -> None:
+        """Record that a person accepted these tools as read: {tool: digest of its definition}.
+        For the whole server the list replaces the earlier one."""
+        with self.lock:
+            servers = self.servers()
+            record = servers.get(server)
+            if record is None:
+                raise StoreError("unknown_server", f"no server named '{server}'")
+            reviewed = {} if whole_server else record.get("reviewed", {})
+            at = int(time.time())
+            reviewed.update({tool: {"digest": value, "by": by, "at": at} for tool, value in digests.items()})
+            record["reviewed"] = reviewed
+            self._save_servers(servers)
+
     # ---------------------------------------------------------- credentials
     def _secrets(self) -> dict:
         path = self.dir / "secrets.bin"
@@ -137,31 +175,76 @@ class SwarmStore:
         token = _fernet().encrypt(json.dumps(secrets).encode("utf-8"))
         _write_private(self.dir / "secrets.bin", token)
 
-    def credentials(self, server: str) -> dict | None:
-        with self.lock:
-            return self._secrets().get(server)
+    # Each person signs in for themselves: secrets.bin holds, per server, {"people": {principal: token}}.
+    @staticmethod
+    def _people(secrets: dict, server: str) -> dict:
+        entry = secrets.get(server)
+        if not isinstance(entry, dict) or not isinstance(entry.get("people"), dict):
+            # None yet, or the one sign-in per server of 0.2.0, which names no principal: it counts
+            # as none, and its person signs in again.
+            return {}
+        return dict(entry["people"])
 
-    def put_credentials(self, server: str, value: dict) -> None:
+    def signins(self, server: str) -> dict[str, dict]:
+        """The sign-ins to `server`, by the principal of the person who signed in."""
+        with self.lock:
+            return self._people(self._secrets(), server)
+
+    def all_signins(self) -> dict[str, dict[str, dict]]:
+        """The sign-ins to every server, read once: {server: {principal: sign-in}}."""
         with self.lock:
             secrets = self._secrets()
-            secrets[server] = value
+            return {server: self._people(secrets, server) for server in secrets}
+
+    def credentials(self, server: str, principal: str | None) -> dict | None:
+        """One person's sign-in to `server`, by their principal."""
+        return self.signins(server).get(principal) if principal else None
+
+    def put_credentials(self, server: str, principal: str, value: dict) -> None:
+        """Keep a person's sign-in to `server`, in place of any earlier one of theirs."""
+        with self.lock:
+            secrets = self._secrets()
+            people = self._people(secrets, server)
+            people[principal] = value
+            secrets[server] = {"people": people}
             self._save_secrets(secrets)
 
-    def delete_credentials(self, server: str) -> bool:
+    def replace_credentials(self, server: str, principal: str, old: dict, new: dict) -> bool:
+        """Store `new` only if the person's stored credentials are still `old`, so a renewal that
+        finishes after a revoke or a new sign-in never writes over them."""
+        with self.lock:
+            secrets = self._secrets()
+            people = self._people(secrets, server)
+            if people.get(principal) != old:
+                return False
+            people[principal] = new
+            secrets[server] = {"people": people}
+            self._save_secrets(secrets)
+            return True
+
+    def delete_credentials(self, server: str, principal: str | None = None) -> bool:
+        """Delete one person's sign-in to `server`, or with no principal every sign-in to it."""
         with self.lock:
             path = self.dir / "secrets.bin"
             if not path.exists():
                 return False
             secrets = self._secrets()
-            removed = secrets.pop(server, None) is not None
+            if principal is None:
+                removed = secrets.pop(server, None) is not None
+            else:
+                people = self._people(secrets, server)
+                removed = people.pop(principal, None) is not None
+                secrets[server] = {"people": people}
             self._save_secrets(secrets)
             return removed
 
-    def has_credentials(self, server: str) -> bool:
+    def has_credentials(self, server: str, principal: str | None = None) -> bool:
+        """Whether this person, or with no principal anyone, is signed in to `server`."""
         try:
-            return self.credentials(server) is not None
+            people = self.signins(server)
         except StoreError:
             return False
+        return bool(people) if principal is None else principal in people
 
     # ---------------------------------------------------------- traces
     def trace(self, entry: dict) -> None:
@@ -173,6 +256,19 @@ class SwarmStore:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             with os.fdopen(fd, "a", encoding="utf-8") as handle:
                 handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+                size = os.fstat(handle.fileno()).st_size
+            if size > TRACE_MAX_BYTES:
+                # Keep the newest half: a trim costs one rewrite per half a limit of new lines.
+                lines = path.read_bytes().splitlines(keepends=True)
+                kept, total = [], 0
+                for raw in reversed(lines):
+                    total += len(raw)
+                    if total > TRACE_MAX_BYTES // 2:
+                        break
+                    kept.append(raw)
+                _write_private(path, b"".join(reversed(kept)))
 
     def traces(self, limit: int = 30) -> list[dict]:
         path = self.dir / "trace.jsonl"
@@ -181,26 +277,62 @@ class SwarmStore:
         lines = path.read_text("utf-8").splitlines()[-max(limit, 0):]
         return [json.loads(line) for line in lines if line.strip()]
 
-    def trace_count(self) -> int:
+    def trace_mark(self) -> str:
+        """Changes with every line traced, also after a trim: the number of lines and the last one."""
         path = self.dir / "trace.jsonl"
         if not path.exists():
-            return 0
-        with path.open("rb") as handle:
-            return sum(1 for _ in handle)
+            return ""
+        lines = path.read_bytes().splitlines()
+        return f"{len(lines)}:{digest(lines[-1].decode('utf-8')) if lines else ''}"
 
     # ---------------------------------------------------------- intents
+    # use-tool's own records keep each answer whole, what the tool sent back included, so they are
+    # encrypted with the tokens' key.
+    def _intents(self) -> dict:
+        """The records, decrypted. A plain intents.json left by an earlier version is moved into the
+        encrypted file and deleted, so no tool result stays on disk in clear."""
+        path, plain = self.dir / "intents.bin", self.dir / "intents.json"
+        data = {}
+        if path.exists():
+            fernet = _fernet(INTENTS)
+            try:
+                data = json.loads(fernet.decrypt(path.read_bytes()).decode("utf-8"))
+            except Exception:  # cryptography's InvalidToken: written with another key
+                raise StoreError("bad_secret_key", f"{INTENTS} cannot be read with this OMEGA_CONNECT_SECRET_KEY")
+        if plain.exists():
+            data = {**json.loads(plain.read_text("utf-8")), **data}
+            self._save_intents(data)
+            plain.unlink()
+            _fsync_folder(self.dir)
+        return data
+
+    def _save_intents(self, data: dict) -> None:
+        """Past INTENTS_MAX_BYTES the records are cut to the newest that fit in half of it, as the
+        trace is; the newest one always stays."""
+        sizes = {key: len(json.dumps({key: record}, sort_keys=True)) for key, record in data.items()}
+        if sum(sizes.values()) > INTENTS_MAX_BYTES:
+            kept, total = {}, 0
+            for key in sorted(data, key=lambda k: data[k].get("at", 0), reverse=True):
+                total += sizes[key]
+                if kept and total > INTENTS_MAX_BYTES // 2:
+                    break
+                kept[key] = data[key]
+            data = kept
+        _write_private(self.dir / "intents.bin",
+                       _fernet(INTENTS).encrypt(json.dumps(data, sort_keys=True).encode("utf-8")))
+
     def intent(self, key: str) -> dict | None:
-        path = self.dir / "intents.json"
-        if not path.exists():
-            return None
-        return json.loads(path.read_text("utf-8")).get(key)
+        with self.lock:
+            return self._intents().get(key)
 
     def put_intent(self, key: str, record: dict) -> None:
         with self.lock:
-            path = self.dir / "intents.json"
-            data = json.loads(path.read_text("utf-8")) if path.exists() else {}
+            data = self._intents()
             data[key] = record
-            if len(data) > TRACE_KEEP:
-                for old in sorted(data, key=lambda k: data[k].get("at", ""))[: len(data) - TRACE_KEEP]:
-                    data.pop(old, None)
-            _write_private(path, json.dumps(data, sort_keys=True).encode())
+            self._save_intents(data)
+
+    def drop_intent(self, key: str) -> None:
+        with self.lock:
+            data = self._intents()
+            if data.pop(key, None) is not None:
+                self._save_intents(data)
