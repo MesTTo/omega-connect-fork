@@ -117,6 +117,19 @@ def test_a_call_that_finds_no_server_is_not_sent(program, engine, restartable_de
     assert call(engine, s, "add", {"a": 2, "b": 2}, retry=False).text == "4"  # a new session
 
 
+def test_a_call_the_server_has_no_session_for_did_not_run(program, engine, restartable_demo):
+    """After a restart the server answers the old session with HTTP 404: it no longer has the session and
+    ran nothing, so the call is NotSent, and the next call opens a new session."""
+    s = spec(program, transport="http", url=restartable_demo.url, command=None, args=[], timeout=5)
+    assert call(engine, s, "list_notes", retry=False).text == "(no notes)"
+    restartable_demo.restart()
+    with pytest.raises(program.engine_mod.NotSent) as forgotten:
+        call(engine, s, "create_note", {"title": "x", "text": "y"}, retry=False)
+    assert "no longer has this session" in forgotten.value.message
+    assert call(engine, s, "list_notes", retry=False).text == "(no notes)"  # a new session
+    assert restartable_demo.calls() == []  # the 404 ran nothing
+
+
 def test_a_call_cut_once_it_was_out_has_an_unknown_outcome(program, engine, demo_url):
     """The server takes the call and dies before it answers: the call may have taken effect. SDK 2.x says
     the stream ended without a response; 1.x says nothing, and the call runs out of time."""

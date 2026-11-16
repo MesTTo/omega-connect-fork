@@ -127,12 +127,15 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
   never kept in clear, and cut to the newest half once they pass 1 MiB, as
   the trace is. Without the key a mind's `use-tool` fails before anything
   goes out.
-- **A write goes out again only if it never reached the server** (open
-  point 6). When a `use-tool` call certainly did not reach the server (the
-  connection was refused or the server could not be reached, or the session
-  ended while the call was waiting to go out), the app tries again in the
-  same act: at most 5 attempts, waiting 0.5, 1, 2 and 4 s between them, none
-  started later than 30 s after the first; the trace counts the attempts.
+- **A write goes out again only if it certainly did not run** (open point
+  6). When a `use-tool` call certainly did not run (the connection was
+  refused or the server could not be reached, the session ended while the
+  call was waiting to go out, or the server answered HTTP 404 for a session
+  it no longer has, as after a restart, and so ran nothing), the app tries
+  again in the same act, on a new session where the old one is gone, as the
+  MCP specification asks of a client after that 404: at most 5 attempts,
+  waiting 0.5, 1, 2 and 4 s between them, none started later than 30 s after
+  the first; the trace counts the attempts.
   When the call may have reached the server and no answer came back (none
   within the server's timeout, or the connection lost while the call was
   out), `use-tool` does not send it again. It answers `refused` with
@@ -287,16 +290,18 @@ Behaviour that changes for a hive that ran 0.1.0:
   `intents.bin`, encrypted with `OMEGA_CONNECT_SECRET_KEY`, which a mind's
   `use-tool` now needs as OAuth sign-in does. A plain `intents.json` left by
   0.1.0 is moved into it and deleted the first time `use-tool` runs.
-- **Failed writes:** a `use-tool` call that never reached the server is tried
-  again, up to five times in the same act; one that may have reached it with
-  no answer back is not sent again, and `use-tool` answers `refused` with
-  `detail.type: "outcome_unknown"` where 0.1.0 answered with an error.
+- **Failed writes:** a `use-tool` call that certainly did not run (it never
+  reached the server, or met a 404 for a session the server no longer has)
+  is tried again, up to five times in the same act; one that may have reached
+  the server with no answer back is not sent again, and `use-tool` answers
+  `refused` with `detail.type: "outcome_unknown"` where 0.1.0 answered with
+  an error.
 
 ## Tests
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 79 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 81 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
@@ -364,7 +369,7 @@ Coverage of failed writes (open point 6):
 
 | Behaviour | Tests |
 |---|---|
-| A write that never reached the server is tried again in the same act, at most 5 times, none started later than 30 s after the first | `test_a_write_that_never_reached_the_server_is_sent_again`, `test_a_write_that_cannot_reach_the_server_stops_after_five_attempts`, `test_a_call_that_finds_no_server_is_not_sent` (engine) |
+| A write that certainly did not run is tried again in the same act, at most 5 times, none started later than 30 s after the first: a refused connection, or a 404 for a session the server no longer has, after which it goes out on a new session and runs once | `test_a_write_that_never_reached_the_server_is_sent_again`, `test_a_write_the_server_has_no_session_for_goes_out_again_on_a_new_one`, `test_a_write_that_cannot_reach_the_server_stops_after_five_attempts`, `test_a_call_that_finds_no_server_is_not_sent` and `test_a_call_the_server_has_no_session_for_did_not_run` (engine) |
 | A write whose outcome is unknown is not sent again: `refused`, `outcome_unknown`; also when a failed act comes back after a new approval | `test_a_write_whose_outcome_is_unknown_is_not_sent_again`, `test_a_write_delivered_again_after_a_failure_is_not_sent_again`, `test_a_call_cut_once_it_was_out_has_an_unknown_outcome` (engine) |
 
 ## Open points for the flagship team
@@ -426,7 +431,10 @@ settled points 4 and 6 on issue #1.
    person approves again. When the outcome is uncertain (a timeout after the
    call went out), nothing is repeated blindly: the mind checks, or goes back
    to a person. `use-tool` tries again within one act, at most 5 attempts
-   and none started later than 30 s after the first, and otherwise answers
+   and none started later than 30 s after the first. A 404 for a session the
+   server no longer has (after a restart, for one) counts as not arrived: the
+   server ran nothing, and the MCP specification has the client open a new
+   session, so `use-tool` does and tries again there. Otherwise it answers
    `outcome_unknown`, also when a failed act comes back and the app's record
    shows that a call went out and no answer came ("What the app guarantees").
 7. **Verified: dependencies.** `requirements.txt` resolved on top of the
