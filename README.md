@@ -17,7 +17,8 @@ review ([Changes in 0.2.0](#changes-in-020)). All actions work against real MCP
 servers over streamable HTTP and stdio, and the offline tests pass.
 `hive.programs_check` from a pre-release copy of omegahive (04fc3f2) reports it
 compatible. The contract fixture is not in that copy; the omegahive repository
-opens around 19–20 November.
+opens around 19–20 November. How the hive runs a mind's action is checked
+against `hive/core/program_actions.py` from omegahive main (832b36e).
 
 ## Actions
 
@@ -106,25 +107,38 @@ not trust, accept nothing, and every call goes through `use-tool` and a person.
   no credentials in URLs. stdio servers start processes on the hive's machine
   and are refused unless the operator sets `OMEGA_CONNECT_ALLOW_STDIO=1`.
 - **One swarm per call.** Server lists, tokens and traces are kept per swarm.
-- **Idempotency twice.** The hive records intents; the app also keeps its own
-  record for `use-tool`, so a retried write returns its recorded result. The
-  hive promises at most one delivery per confirm, not exactly-once effects
-  (PROGRAMS.md 9d). Just before a `use-tool` call goes out, the app records
-  it without a result. When the hive delivers again an attempt that failed
-  with an unknown effect and that record has no result yet, `use-tool` runs
-  the tool again and the result says the first attempt may already have taken
-  effect (`detail.prior_failed: true`). The app needs its own record for this
-  if, as MesTTo reads flagship main, the hive's agent route delivers a mind's
-  failed attempt again with the same `record_id` and no
-  `ctx.command.prior_failed` (open point 6). An identical retry of a write the
-  hive recorded as done comes back as a recovery (`ctx.actor.recovery`, with
-  the approval it first ran under; open point 3): `use-tool` answers from its own
-  record, and if that record is gone it refuses (`detail.type: "recovery"`)
-  instead of running the tool a second time. Those records keep each answer
-  whole, what the tool sent back included, so they are encrypted with the
-  tokens' key (`intents.bin`), never kept in clear, and cut to the newest half
-  once they pass 1 MiB, as the trace is. Without the key a mind's `use-tool`
-  fails before anything goes out.
+- **Idempotency twice.** The hive records every act of a mind under its
+  idempotency key, and answers an identical retry of an act it recorded as
+  done from that record, without calling the app (open point 3). The app
+  also keeps its own record for `use-tool`, so a retried write returns its
+  recorded result there too. `use-tool` declares no `revalidate`, which
+  would have the hive deliver such a retry to the app as a recovery; should
+  one come (`ctx.actor.recovery`), `use-tool` answers from its own record,
+  or without it from the hive's (`ctx.command.recorded_result`), and with
+  neither it refuses (`detail.type: "recovery"`): the tool never runs a
+  second time. Just before a `use-tool` call goes out, the app records it
+  without an answer. When `act()` raises, the hive marks the act failed, and
+  the mind's identical retry comes back after a new approval, with the same
+  `record_id` and no `ctx.command.prior_failed`. If the app's record of it
+  still has no answer, that attempt may have reached the server, so
+  `use-tool` does not send it again and answers `outcome_unknown` (next
+  point). Those records keep each answer whole, what the tool sent back
+  included, so they are encrypted with the tokens' key (`intents.bin`),
+  never kept in clear, and cut to the newest half once they pass 1 MiB, as
+  the trace is. Without the key a mind's `use-tool` fails before anything
+  goes out.
+- **A write goes out again only if it never reached the server** (open
+  point 6). When a `use-tool` call certainly did not reach the server (the
+  connection was refused or the server could not be reached, or the session
+  ended while the call was waiting to go out), the app tries again in the
+  same act: at most 5 attempts, waiting 0.5, 1, 2 and 4 s between them, none
+  started later than 30 s after the first; the trace counts the attempts.
+  When the call may have reached the server and no answer came back (none
+  within the server's timeout, or the connection lost while the call was
+  out), `use-tool` does not send it again. It answers `refused` with
+  `detail.type: "outcome_unknown"`, and tells the mind to check whether the
+  write took effect, for example with `read-tool`, and if it did not, to
+  make a new request (a new idempotency key), which a person approves again.
 
 ## Mount it in a hive
 
@@ -247,30 +261,37 @@ Behaviour that changes for a hive that ran 0.1.0:
   `intents.bin`, encrypted with `OMEGA_CONNECT_SECRET_KEY`, which a mind's
   `use-tool` now needs as OAuth sign-in does. A plain `intents.json` left by
   0.1.0 is moved into it and deleted the first time `use-tool` runs.
+- **Failed writes:** a `use-tool` call that never reached the server is tried
+  again, up to five times in the same act; one that may have reached it with
+  no answer back is not sent again, and `use-tool` answers `refused` with
+  `detail.type: "outcome_unknown"` where 0.1.0 answered with an error.
 
 ## Tests
 
 ```sh
 pip install -r requirements-dev.txt
-python -m pytest -q tests        # 64 tests, mock MCP servers on localhost, no outside network
+python -m pytest -q tests        # 76 tests, mock MCP servers on localhost, no outside network
 ```
 
 Both suites (this one and `examples/teams-mcp`) pass with MCP SDK 2.3 and
 1.30.
 
 `tests/fakehive.py` is a small stand-in for the host that follows the public
-contract notes and `hive/PROGRAMS.md`, and on the minds' route answers as
-`hive/core/program_actions.py` on flagship main does (open points 3 and 6:
-confirmed by MesTTo, or MesTTo's reading; to verify on a scratch hive): agent
-flag, no default allow,
-`approval_required` with an `approval_id` that the mind sends back once a
-person approves, approvals bound to the exact request and its key and
-redeemed once, the approval in `ctx.actor.approval`, the hive's record id in
-`ctx.command`, an identical retry of a done act delivered again as a recovery
-with its original approval, failed attempts delivered again with the same
-record id and no `prior_failed`, `base_revision` added to params, read actions stored as
-digests only, confirm for people's actions, refusal of identity and
-credential keys.
+contract notes and `hive/PROGRAMS.md`, and runs actions as
+`hive/core/program_actions.py` from omegahive main (832b36e) does: request
+keys checked as the hive checks them (no identity or credential-like key at
+the top level), the agent flag, no default allow, `approval_required` with an
+`approval_id` that the mind sends back once a person approves, approvals
+bound to the exact request and its key and redeemed once, `approver:
+"person"` refusing the local operator password both as approver and on the
+person route, the approval in `ctx.actor.approval`, the hive's record id in
+`ctx.command`, an identical retry of a done act answered from the hive's
+record (delivered as a recovery, with `recorded_result`, only for an action
+that declares `revalidate: true`), failed acts delivered again after a new
+approval with the same record id and no `prior_failed`, `base_revision`
+added to params, read actions stored as digests only, confirm for people's
+actions. `tests/test_fakehive.py` checks the fake host itself, with a stub
+app that declares what omega-connect does not.
 
 `tests/test_contract.py` runs the app through the same fake host with the
 hive's own `validate_graph` and `validate_result` (`hive/core/programs.py`)
@@ -285,7 +306,7 @@ Coverage against the brief's definition of done:
 | A read-classed tool through `read-tool` | `test_read_tool_runs_a_read_classed_tool` |
 | A write-classed tool refused through `read-tool` | `test_read_tool_refuses_a_write_classed_tool` |
 | `use-tool` waiting for approval | `test_use_tool_waits_for_a_person` |
-| An identical retry returning the recorded result | `test_identical_retry_returns_the_recorded_result`, `test_app_level_idempotency_also_holds`, `test_an_identical_retry_is_a_recovery_that_runs_nothing_again` |
+| An identical retry returning the recorded result | `test_identical_retry_returns_the_recorded_result`, `test_app_level_idempotency_also_holds`, `test_a_recovery_answers_from_the_apps_record_or_the_hives` |
 | Tokens never in results, views or logs | `test_tokens_never_appear_in_results_views_traces_or_logs`, `test_device_code_sign_in_and_revoke`, `test_browser_sign_in_with_pkce` |
 | `programs_check` passes | COMPATIBLE with the pre-release copy: `cd ../omegahive-app-contract-04fc3f2 && python -m hive.programs_check ../omega-connect`. It sees only an empty view, so `test_contract.py` checks fuller views and every result with the hive's validators |
 | Live demo: read a Teams channel, then a write a person approves | run on a real tenant with `examples/teams-mcp/demo.py`, in the repository's fake hive (13 Nov 2026: the channel read, a message posted once approved); on a scratch hive still to do. `test_demo.py` and the last test of `test_server.py` rehearse it offline |
@@ -305,15 +326,24 @@ Coverage of the first review's changes:
 | Token renewal: off the event loop, once at a time per server, never over a revoke | `test_a_token_renewal_does_not_block_the_event_loop`, `test_calls_on_several_loops_renew_the_token_once`, `test_a_renewal_that_ends_after_a_revoke_does_not_bring_the_token_back` |
 | A renewed token opens a new session; the call running on the old one finishes | `test_a_renewed_token_opens_a_new_session`, `test_a_call_running_when_the_token_is_renewed_finishes_on_its_session` |
 
+Coverage of failed writes (open point 6):
+
+| Behaviour | Tests |
+|---|---|
+| A write that never reached the server is tried again in the same act, at most 5 times, none started later than 30 s after the first | `test_a_write_that_never_reached_the_server_is_sent_again`, `test_a_write_that_cannot_reach_the_server_stops_after_five_attempts`, `test_a_call_that_finds_no_server_is_not_sent` (engine) |
+| A write whose outcome is unknown is not sent again: `refused`, `outcome_unknown`; also when a failed act comes back after a new approval | `test_a_write_whose_outcome_is_unknown_is_not_sent_again`, `test_a_write_delivered_again_after_a_failure_is_not_sent_again`, `test_a_call_cut_once_it_was_out_has_an_unknown_outcome` (engine) |
+
 ## Open points for the flagship team
 
 Checked against `hive/PROGRAMS.md` in the pre-release copy of omegahive
-(04fc3f2): sections 1–5, "Read actions" and 9d. The first review (Dot, for Jon
-Grove, on 8051f30) answered each of them. MesTTo's pull requests (#3–#11) added
-what the minds' route does in `hive/core/program_actions.py` on flagship main,
-a private repository: that file, like `hive/requirements.txt` and
-`hive/ci-constraints.txt`, is not in the 04fc3f2 copy, so points 3, 6 and 7
-rest on MesTTo's word and are to verify on a scratch hive.
+(04fc3f2): sections 1–5, "Read actions" and 9d, and against
+`hive/core/program_actions.py` and `hive/ci-constraints.txt` from omegahive
+main at 832b36e, which Jon Grove sent (unchanged since 04fc3f2, by his note;
+the repository is private until it opens, and neither file is copied here).
+The first review (Dot, for Jon Grove, on 8051f30) answered each point; what
+MesTTo described of the minds' route (pull requests #3–#11, and on issue #2
+that a recovery comes only for `revalidate: true`) matches that file; Jon
+settled point 6 on issue #1.
 
 1. **Settled: `use-tool` declares no effect.** The contract defines only
    `"effect": "read"`, for actions that change nothing and are safe to repeat;
@@ -324,18 +354,20 @@ rest on MesTTo's word and are to verify on a scratch hive.
    (`list-servers`, `add-server`) stays `["server"]`. The contract shows
    `applies_to` only as a list of kinds and says nothing about actions without
    an item; the review found this choice fine.
-3. **`act()` is told who approved: confirmed by MesTTo against flagship
-   main, to verify on a scratch hive.** PROGRAMS.md does not say so. On the
-   minds' route under "ask", the hive answers `approval_required` with an
-   `approval_id`; when the mind repeats the request with that `approval_id`,
-   `act()` gets `ctx.actor.approval = {id, binding_digest, approved_by}`,
+3. **Verified: `act()` is told who approved.** PROGRAMS.md does not say so;
+   `hive/core/program_actions.py` (832b36e) does. On the minds' route under
+   "ask", the hive answers `approval_required` with an `approval_id`; when the
+   mind repeats the request with that `approval_id`, the hive redeems it once
+   and `act()` gets `ctx.actor.approval = {id, binding_digest, approved_by}`,
    `approved_by` being the approver's principal. Under "allow" the approval is
-   `None`. An identical retry of an act already recorded gets the original
-   approval again, with `recovery: true` (`hive/core/program_actions.py`,
-   `agent_act` and `_approval`). `ctx.command` carries the request identity:
-   `idempotency_key` and `record_id`. So traces keep the approver, the
-   approval's id and `record_id`; a mind's `use-tool` with no approval is
-   refused; and a recovery never runs a tool twice.
+   `None`. `ctx.command` carries the request identity: `idempotency_key` and
+   `record_id`. An identical retry of an act recorded as done gets the
+   recorded answer from the hive, without reaching the app, unless the action
+   declares `revalidate: true`: only then is it a recovery, with the original
+   approval, `recovery: true` and `ctx.command.recorded_result` (as MesTTo
+   said on #2). `use-tool` declares no `revalidate`. So traces keep the
+   approver, the approval's id and `record_id`; a mind's `use-tool` with no
+   approval is refused; and an identical retry never runs a tool twice.
 4. **Later, on its own branch: which person a mind acts for.** Today a server
    uses the token of the person who last completed `connect`, and the view
    shows which account that is. Issue #8 proposes a sign-in per person, which
@@ -345,29 +377,35 @@ rest on MesTTo's word and are to verify on a scratch hive.
    not in this branch: it comes later, on the branch `per-person-signin`.
 5. **Agreed, as a separate small piece:** the mind skill for native Omega
    minds (brief, "a second, smaller piece").
-6. **Failed writes delivered again after "ask": MesTTo's reading of flagship
-   main, to confirm.** Section 9d describes `prior_failed` for acts a person
-   confirms in the host. For a mind, MesTTo reads `hive/core/program_actions.py`
-   (`agent_act`) as delivering a failed attempt again only after a new
-   approval, with the same `record_id` and no `prior_failed`. The app does not
-   depend on it: it records each call just before it goes out, so it knows
-   such an attempt either way.
-7. **Dependencies: no conflict, by MesTTo's check, to confirm.** MesTTo
-   resolved `requirements.txt` with the hive's `hive/requirements.txt` under
-   the pins of its CI (`pip install --dry-run -c hive/ci-constraints.txt`,
-   Python 3.12): nothing clashes and no pinned version moves. MCP SDK 2.3 adds
-   13 packages the hive does not pin (`mcp`, `mcp-types`, `httpx2`,
+6. **Settled: failed writes** (Jon Grove on #1). When `act()` raises, the
+   hive marks the act failed, and the mind's identical retry comes back only
+   after a new approval, with the same `record_id` and no `prior_failed`,
+   which the hive sets only for actions that declare `person_activity`
+   (verified in `hive/core/program_actions.py`). A failed write is sent again
+   automatically only when it certainly did not arrive (a refused
+   connection, for one), at most five times in five minutes; after that a
+   person approves again. When the outcome is uncertain (a timeout after the
+   call went out), nothing is repeated blindly: the mind checks, or goes back
+   to a person. `use-tool` tries again within one act, at most 5 attempts
+   and none started later than 30 s after the first, and otherwise answers
+   `outcome_unknown`, also when a failed act comes back and the app's record
+   shows that a call went out and no answer came ("What the app guarantees").
+7. **Verified: dependencies.** `requirements.txt` resolved on top of the
+   exact set the hive's CI installs (`hive/ci-constraints.txt`, 832b36e), as
+   Linux x86_64 CPython 3.12: `pip install --dry-run` of every pinned package
+   and `requirements.txt`, with `-c hive/ci-constraints.txt`. Nothing clashes
+   and no pinned version moves, as MesTTo found. It picks MCP SDK 2.3, which
+   adds 13 packages the hive does not pin (`mcp`, `mcp-types`, `httpx2`,
    `httpcore2`, `jsonschema`, `jsonschema-specifications`, `referencing`,
    `rpds-py`, `attrs`, `pyjwt`, `python-multipart`, `sse-starlette`,
-   `truststore`), so the ranges stay as they are. Those two files are not in
-   the 04fc3f2 copy, so this was not repeated here.
+   `truststore`); 1.30 would add 11. The ranges stay as they are.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `plugin.json`, `program.py` | App identity and the host program (`describe` / `view` / `act`) |
-| `connect/engine.py` | MCP sessions: one long-lived task per server on a private event loop; tool lists and their definition digests |
+| `connect/engine.py` | MCP sessions: one long-lived task per server on a private event loop; tool lists and their definition digests; whether a failed call went out |
 | `connect/store.py` | Per-swarm servers (with the reads a person accepted), encrypted credentials and `use-tool` records, traces |
 | `connect/oauth.py` | OAuth 2.0 device authorization grant (standard library only) |
 | `tests/` | Fake host, mock MCP server, fake identity provider, tests |
