@@ -740,7 +740,13 @@ async def act(ctx, action, items, params):
             handler = {"add-server": _add_server, "remove-server": _remove_server, "accept-reads": _accept_reads,
                        "reclass-tool": _reclass_tool, "connect": _connect, "revoke": _revoke}[action]
             result = handler(ctx, swarm, store, items, params)
-            return await result if asyncio.iscoroutine(result) else result
+            result = await result if asyncio.iscoroutine(result) else result
+            # A change made from the page shows at once: a done result's graph replaces the host's view (PROGRAMS.md
+            # §3), so it carries the view after the change, at the step the person was on (the host sends focus and
+            # stage with every act). Without it the page kept "No servers yet" after add-server.
+            if result.get("status") == "done" and "graph" not in result:
+                result["graph"] = view(ctx, params.get("focus"), params.get("stage") or "unfold")
+            return result
         return _refused(f"unknown action '{action}'")
     except _NoSignin as exc:
         return _refused(exc.message, detail={"type": exc.kind})

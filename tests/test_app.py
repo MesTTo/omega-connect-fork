@@ -184,6 +184,19 @@ def test_add_server_takes_the_sign_in_as_a_pages_flat_fields(hive, demo_url, mon
     assert hive.program.store_mod.SwarmStore("s1").servers()["both"]["auth"] == {"kind": "none"}
 
 
+def test_a_change_from_the_page_returns_the_view_after_it(hive, demo_url):
+    """A hive page replaces its view with a done result's graph, so a change made there carries the view after it: the
+    new server shows at once, at the step the person was on (the page sends focus and stage with every act)."""
+    first = add(hive, "s1", "demo", demo_url, focus=None, stage="unfold")
+    assert first["status"] == "done" and "server:demo" in {i["id"] for i in first["graph"]["items"]}
+    second = add(hive, "s1", "other", demo_url, focus="server:demo", stage="map")
+    assert {"server:demo", "server:other"} <= {i["id"] for i in second["graph"]["items"]}
+    assert second["graph"]["focus"] == "server:demo"
+    gone = run(hive.person_act("s1", PERSON, "remove-server", ["server:other"], {"stage": "unfold"}, confirmed=True))
+    assert gone["status"] == "done" and "server:other" not in {i["id"] for i in gone["graph"]["items"]}
+    assert "graph" not in add(hive, "s1", "odd", demo_url, signin_kind="password")   # refused: nothing changed
+
+
 # ------------------------------------------------------------------ done #2
 
 def test_lists_servers_and_tools(hive, demo_url):
